@@ -28,3 +28,6 @@ third_party
 
 # Dataset images & protocols (large / license — obtain separately; see README „Data”)
 data/
+
+# Large embedding caches (regenerate via notebooks)
+results/*.npz
