@@ -1,0 +1,6 @@
+# Nie wrzucaj ciężkich wag do Space (limit 1 GB) — pobierane z HF Hub przy starcie (SWINFACE_HF_REPO).
+models/swinface.pt
+__pycache__/
+*.pyc
+.cache/
+models/models/

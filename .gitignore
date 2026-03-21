@@ -1,0 +1,30 @@
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+*.egg-info/
+dist/
+build/
+.ipynb_checkpoints/
+mlruns/
+*.onnx
+models/*.pt
+models/*.onnx
+
+# Generated notebook outputs (regenerable)
+eda_output/
+notebooks/align_output/
+notebooks/comparison_output/
+notebooks/embedding_output/
+notebooks/evaluation_output/
+notebooks/pad_output/
+notebooks/pdf/
+notebooks/xai_output/
+zdjecia
+logs
+
+# Optional: cały third_party poza Gitem (np. lokalny SwinFace); świeży klon bez tego katalogu → bash scripts/bootstrap_swinface.sh
+third_party
+
+# Dataset images & protocols (large / license — obtain separately; see README „Data”)
+data/

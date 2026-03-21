@@ -1,0 +1,5 @@
+Model,Dataset,AUC,EER,Thr_EER,TAR@FAR=1%,TAR@FAR=0.1%,TAR@FAR=0.01%
+ArcFace (buffalo_l / w600k_r50),AgeDB-30,0.9906,2.50%,0.1625,96.77%,94.60%,94.43%
+ArcFace (buffalo_l / w600k_r50),LFW,0.9995,0.33%,0.1881,99.80%,99.73%,99.73%
+GhostFaceNetV2,AgeDB-30,0.9894,3.32%,0.1706,95.30%,91.23%,75.20%
+GhostFaceNetV2,LFW,0.9988,0.57%,0.2188,99.50%,98.67%,95.73%

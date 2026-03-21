@@ -1,0 +1,7 @@
+gradio>=6.9.0
+deepface>=0.0.92
+numpy>=1.26.0,<2.3
+opencv-python-headless>=4.8.0,<4.11
+pandas>=2.2.0,<3.0
+tf-keras>=2.21.0
+torch>=2.8.0
