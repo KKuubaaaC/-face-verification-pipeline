@@ -42,7 +42,7 @@ Multi-layer PAD stack evaluated in `notebooks/07_PAD_analysis.ipynb` (summary me
 
 ```
 .
-├── data/                 # AgeDB / LFW-style trees (local only — not in Git; see „Data”)
+├── data/                 # AgeDB / LFW-style trees (local only — not in Git; see .gitignore)
 ├── eda_output/           # EDA tables, figures, per-dataset CSV caches (e.g. AgeDB/LFW)
 ├── notebooks/            # Numbered research notebooks (detection → PAD)
 ├── results/              # Parsed pairs, distance caches, evaluation_metrics.csv
@@ -85,26 +85,11 @@ bash scripts/bootstrap_swinface.sh
 
 That shallow-clones into `third_party/swinface`, `space-main/third_party/swinface`, and `space-liveness/third_party/swinface` when those paths are empty. If you already keep your own tree there (without a nested `.git`), the script skips it. To track SwinFace as a submodule instead, use `git submodule` against the same URL.
 
-### Data (`data/`)
-
-The `data/` directory is **not committed** (size and dataset licensing). Obtain **AgeDB** and **LFW** (or your protocol) from the official releases, then lay out the expected layout under `data/` — e.g. `data/agedb/` and `data/lfw/` with `imgs/`, `img.list`, `pair.list` as used by `scripts/parse_pairs.py` and the notebooks.
-
-Pointers (official sources):
-
-- **LFW** — [Labeled Faces in the Wild](http://vis-www.cs.umass.edu/lfw/) (download and unpack to match your `img.list` paths).
-- **AgeDB** — use the official distribution for **AgeDB-30** / verification protocol as in your benchmark setup (see dataset documentation for the exact folder layout).
-
-After images are in place:
-
-```bash
-python scripts/parse_pairs.py
-```
-
 ## Docker
 
 ```bash
-docker build -t nask-face .
-docker run -p 8888:8888 nask-face
+docker build -t face-verification .
+docker run -p 8888:8888 face-verification
 ```
 
 The image starts Jupyter Notebook on `0.0.0.0:8888` (see `Dockerfile` `CMD`). Mount data or copy artifacts into the container as needed for your runs.

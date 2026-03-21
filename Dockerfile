@@ -1,7 +1,7 @@
 FROM python:3.11-slim AS base
 
 LABEL maintainer="Jakub <jakub@example.com>"
-LABEL description="NASK Face Recognition — Reproducible Research Environment"
+LABEL description="Face verification — reproducible research environment"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
