@@ -1,0 +1,7 @@
+Model,Dataset,AUC,EER (%),TAR@FAR=1e-02,TAR@FAR=1e-03,TAR@FAR=1e-04
+ArcFace (ResNet-50),AgeDB-30,0.9906,2.5,96.73%,94.60%,94.43%
+ArcFace (ResNet-50),LFW,0.9995,0.33,99.80%,99.73%,99.73%
+GhostFaceNetV2,AgeDB-30,0.9894,3.32,95.20%,89.23%,75.20%
+GhostFaceNetV2,LFW,0.9988,0.57,99.50%,98.57%,95.73%
+SwinFace (Swin-T),AgeDB-30,0.9915,2.23,97.20%,95.83%,94.70%
+SwinFace (Swin-T),LFW,0.9992,0.15,99.77%,99.73%,99.67%

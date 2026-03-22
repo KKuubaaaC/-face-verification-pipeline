@@ -1,0 +1,11 @@
+2026-03-16 19:38:39 [INFO] START parse_pairs.py — PROJECT_ROOT=/Users/jakub/Desktop/NASK_ZADANIE
+2026-03-16 19:38:39 [INFO] === Dataset: agedb ===
+2026-03-16 19:38:39 [DEBUG] img.list: załadowano 12000 wpisów z /Users/jakub/Desktop/NASK_ZADANIE/data/agedb/img.list
+2026-03-16 19:38:39 [INFO] [agedb] Sparsowano 6000 par: genuine=3000, impostor=3000 | bad_label=0, self_pair=0 | missing_files=0
+2026-03-16 19:38:39 [INFO] Zapisano 6000 wierszy → /Users/jakub/Desktop/NASK_ZADANIE/results/pairs_agedb.csv
+2026-03-16 19:38:39 [INFO] === Dataset: lfw ===
+2026-03-16 19:38:39 [DEBUG] img.list: załadowano 12000 wpisów z /Users/jakub/Desktop/NASK_ZADANIE/data/lfw/img.list
+2026-03-16 19:38:39 [INFO] [lfw] Sparsowano 6000 par: genuine=3000, impostor=3000 | bad_label=0, self_pair=0 | missing_files=0
+2026-03-16 19:38:39 [INFO] Zapisano 6000 wierszy → /Users/jakub/Desktop/NASK_ZADANIE/results/pairs_lfw.csv
+2026-03-16 19:38:39 [INFO] Brak brakujących plików — log nie zostanie zapisany.
+2026-03-16 19:38:39 [INFO] DONE

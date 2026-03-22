@@ -1,17 +1,17 @@
 """
-SwinFace embedder — wrapper wokół modelu SwinFace (Swin Transformer).
+SwinFace embedder — thin wrapper around the SwinFace Swin Transformer stack.
 
-Architektura (SwinFace, Liu et al. 2023 — arxiv:2308.11509):
+Architecture (SwinFace, Liu et al. 2023 — arxiv:2308.11509):
   backbone : Swin-T (img_size=112, patch_size=2, embed_dim=96, depths=[2,2,6,2])
-  FAM      : Feature Attention Module (CBAM channel attention, split 3×3 conv)
-  TSS      : Task-Specific Subnets (11 gałęzi)
-  OM       : Output Module → 42 zadania + Recognition (embedding)
+  FAM      : Feature Attention Module (CBAM, split 3×3 conv)
+  TSS      : Task-Specific Subnets (11 branches)
+  OM       : Output Module → 42 heads + recognition embedding
 
-Wejście:  (112, 112, 3) BGR uint8  — aligned crop z FaceDetector
-Wyjście:  512-D embedding L2-normalized  (Recognition head)
-Multitask: Age (regresja), Gender, Expression (7 klas), 40 atrybutów twarzy
+Input:  (112, 112, 3) BGR uint8 aligned crop from FaceDetector
+Output: 512-D L2-normalized recognition embedding
+Multitask: age regression, gender, expression (7 RAF-DB classes), 40 face attributes
 
-Checkpoint: models/swinface.pt
+Weights: models/swinface.pt
 """
 
 from __future__ import annotations
@@ -32,12 +32,12 @@ from src.vision.embedder import VERIFICATION_THRESHOLD, VerificationResult, _l2_
 
 logger = logging.getLogger(__name__)
 
-# Ścieżki ─────────────────────────────────────────────────────────────────────
+# Paths ---
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 _SWINFACE_SRC = _PROJECT_ROOT / "third_party" / "swinface" / "swinface_project"
 _CHECKPOINT = _PROJECT_ROOT / "models" / "swinface.pt"
 
-# Etykiety ekspresji (RAF-DB: 7 klas) ─────────────────────────────────────────
+# RAF-DB expression labels (7 classes) ---
 _EXPRESSION_LABELS = ["Angry", "Disgust", "Fear", "Happy", "Sad", "Surprise", "Neutral"]
 
 _SWINFACE_BOOTSTRAPPED = False
@@ -45,18 +45,17 @@ _SWINFACE_BOOTSTRAPPED = False
 
 def _bootstrap_swinface_imports() -> None:
     """
-    Ładuje wyłącznie moduły SwinFace potrzebne do inferencji, omijając
-    analysis/__init__.py (który wymaga mxnet, tensorboard — zależności treningowe).
+    Load only the SwinFace modules needed for inference, skipping analysis/__init__.py
+    (which pulls mxnet/tensorboard training deps).
 
-    Używamy importlib.util.spec_from_file_location żeby załadować poszczególne
-    pliki .py bezpośrednio, bez uruchamiania __init__.py pakietów.
+    Files are loaded via importlib.util.spec_from_file_location without package __init__.
     """
     global _SWINFACE_BOOTSTRAPPED
     if _SWINFACE_BOOTSTRAPPED:
         return
 
     def _load_file(module_name: str, file_path: Path) -> types.ModuleType:
-        """Ładuje pojedynczy plik .py jako moduł o podanej nazwie."""
+        """Load a single .py file as a module."""
         spec = importlib.util.spec_from_file_location(module_name, file_path)
         mod = importlib.util.module_from_spec(spec)
         mod.__package__ = module_name.rsplit(".", 1)[0] if "." in module_name else ""
@@ -67,8 +66,7 @@ def _bootstrap_swinface_imports() -> None:
     _a = _SWINFACE_SRC / "analysis"
     _b = _SWINFACE_SRC / "backbones"
 
-    # ── analysis package (stub __init__ + realne submoduły) ─────────────────
-    # Tworzymy pusty pakiet 'analysis' — unikamy mxnet/tensorboard w __init__.py
+    # --- analysis package (empty __init__ + real submodules) ---
     analysis_pkg = types.ModuleType("analysis")
     analysis_pkg.__path__ = [str(_a)]
     analysis_pkg.__package__ = "analysis"
@@ -88,20 +86,20 @@ def _bootstrap_swinface_imports() -> None:
     swin_mod = _load_file("backbones.swin", _b / "swin.py")
     backbones_pkg.swin = swin_mod  # type: ignore[attr-defined]
 
-    # get_model inline (odpowiednik backbones/__init__.py, tylko swin_t)
+    # get_model inline (subset of backbones/__init__.py)
     def _get_model(name: str, **kwargs):  # type: ignore[override]
         if name == "swin_t":
             from backbones.swin import SwinTransformer  # noqa: PLC0415
 
             return SwinTransformer(num_classes=kwargs.get("num_features", 512))
-        raise ValueError(f"Nieznana architektura: {name}")
+        raise ValueError(f"Unknown backbone: {name}")
 
     backbones_pkg.get_model = _get_model  # type: ignore[attr-defined]
 
     _SWINFACE_BOOTSTRAPPED = True
 
 
-# ─── Konfiguracja modelu (identyczna jak w inference.py) ─────────────────────
+# --- Model config (matches upstream inference.py) ---
 
 
 class _SwinFaceCfg:
@@ -118,36 +116,35 @@ class _SwinFaceCfg:
     embedding_size = 512
 
 
-# ─── Wynik multitask ─────────────────────────────────────────────────────────
+# --- Multitask output ---
 
 
 @dataclass
 class SwinFaceAnalysis:
-    """Wyniki wszystkich zadań SwinFace dla jednego obrazu."""
+    """SwinFace multitask outputs for one crop."""
 
     embedding: np.ndarray  # (512,) float32 L2-normalized
-    age: float  # wartość regresji (przybliżony wiek)
+    age: float  # regression output
     gender: str  # "Male" / "Female"
-    gender_conf: float  # pewność [0, 1]
-    expression: str  # etykieta ekspresji (RAF-DB)
-    expression_conf: float  # pewność [0, 1]
+    gender_conf: float  # confidence [0, 1]
+    expression: str  # RAF-DB label
+    expression_conf: float  # confidence [0, 1]
     smiling: bool
     eyeglasses: bool
     attrs: dict[str, float] = field(default_factory=dict)
-    # wybrane atrybuty binarne → prawdopodobieństwo klasy True [0,1]
+    # optional binary attribute heads -> P(True)
 
 
-# ─── Embedder ────────────────────────────────────────────────────────────────
+# --- Embedder ---
 
 
 class SwinFaceEmbedder:
     """
-    Lazy-load SwinFace przy pierwszym wywołaniu.
+    Eager-load SwinFace weights in __init__.
 
-    Użycie:
         emb = SwinFaceEmbedder()
-        vec = emb.embed(aligned_crop)          # → (512,) L2-normalized
-        analysis = emb.analyze(aligned_crop)   # → SwinFaceAnalysis
+        vec = emb.embed(aligned_crop)
+        analysis = emb.analyze(aligned_crop)
     """
 
     def __init__(self) -> None:
@@ -155,18 +152,17 @@ class SwinFaceEmbedder:
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._load_model()
 
-    # ── Ładowanie modelu ──────────────────────────────────────────────────
+    # --- Weight loading ---
 
     def _load_model(self) -> None:
         if not _CHECKPOINT.exists():
             raise FileNotFoundError(
-                f"Brak pliku wag SwinFace: {_CHECKPOINT}\n"
-                "Pobierz z: https://drive.google.com/drive/folders/"
+                f"Missing SwinFace checkpoint: {_CHECKPOINT}\n"
+                "Download from: https://drive.google.com/drive/folders/"
                 "1NjVN3Kp_Tmwt17hWCIWgHpuWzkHYaman"
             )
 
-        # Ładujemy tylko moduły potrzebne do inferencji, omijając __init__.py
-        # pakietu 'analysis' (który importuje mxnet, tensorboard itp. — tylko trening).
+        # Inference-only imports (skip analysis/__init__.py training stack).
         _bootstrap_swinface_imports()
 
         from analysis.subnets import (  # noqa: PLC0415
@@ -177,11 +173,10 @@ class SwinFaceEmbedder:
         )
         from backbones import get_model  # noqa: PLC0415
 
-        logger.info("SwinFace: ładowanie modelu (device=%s)...", self._device)
+        logger.info("SwinFace: loading weights (device=%s)...", self._device)
         cfg = _SwinFaceCfg()
 
-        # Odtwarzamy build_model inline (nie importujemy model.py żeby uniknąć
-        # ponownego triggeru analysis/__init__.py)
+        # Inline build_model (avoid importing model.py / analysis __init__)
         backbone = get_model(cfg.network, num_features=cfg.embedding_size)
         fam = FeatureAttentionModule(
             in_chans=cfg.fam_in_chans,
@@ -204,54 +199,49 @@ class SwinFaceEmbedder:
         model.om.load_state_dict(ckpt["state_dict_om"])
 
         self._model = model.eval().to(self._device)
-        logger.info("SwinFace: model gotowy.")
+        logger.info("SwinFace: model ready.")
 
-    # ── Publiczne API ─────────────────────────────────────────────────────
+    # --- Public API ---
 
     def embed(self, aligned_crop: np.ndarray) -> np.ndarray:
         """
-        Ekstrakcja embeddingu rozpoznawania twarzy.
+        Recognition embedding.
 
         aligned_crop : (112, 112, 3) BGR uint8
-        Zwraca       : (512,) float32 L2-normalized
+        Returns      : (512,) float32 L2-normalized
         """
         output = self._forward(aligned_crop)
         raw = output["Recognition"][0].cpu().numpy().astype(np.float32)
         return _l2_normalize(raw)
 
     def analyze(self, aligned_crop: np.ndarray) -> SwinFaceAnalysis:
-        """
-        Pełna analiza multitask dla jednego cropa.
-
-        Zwraca SwinFaceAnalysis z embeddingiem, wiekiem, płcią,
-        ekspresją i wybranymi atrybutami.
-        """
+        """Run every SwinFace head for one aligned crop."""
         output = self._forward(aligned_crop)
 
         embedding = _l2_normalize(output["Recognition"][0].cpu().numpy().astype(np.float32))
 
-        # Age — regresja (batch=1 → scalar)
+        # Age — regression (batch=1)
         age_raw = float(output["Age"][0].cpu().item())
 
-        # Gender — softmax na 2 klasach: 0=Female, 1=Male (kolejność z OM)
+        # Gender — 2-way softmax (0=Female, 1=Male per OM)
         gender_logits = output["Gender"][0].cpu().float()
         gender_probs = torch.softmax(gender_logits, dim=0).numpy()
         gender_idx = int(np.argmax(gender_probs))
         gender_label = "Male" if gender_idx == 1 else "Female"
         gender_conf = float(gender_probs[gender_idx])
 
-        # Expression — 7 klas RAF-DB
+        # Expression — 7-class RAF-DB
         expr_logits = output["Expression"][0].cpu().float()
         expr_probs = torch.softmax(expr_logits, dim=0).numpy()
         expr_idx = int(np.argmax(expr_probs))
         expr_label = _EXPRESSION_LABELS[expr_idx]
         expr_conf = float(expr_probs[expr_idx])
 
-        # Smiling i Eyeglasses — binary (2 klasy: 0=No, 1=Yes)
+        # Smiling / Eyeglasses — binary (0=No, 1=Yes)
         smiling_prob = _binary_prob(output["Smiling"][0])
         eyeglasses_prob = _binary_prob(output["Eyeglasses"][0])
 
-        # Wybrane atrybuty binarne → dict {name: prob_True}
+        # Optional binary attribute heads
         attr_names = [
             "Attractive",
             "Heavy Makeup",
@@ -291,7 +281,7 @@ class SwinFaceEmbedder:
         emb_b: np.ndarray,
         threshold: float = VERIFICATION_THRESHOLD,
     ) -> VerificationResult:
-        """Porównanie dystansem kosinusowym (identyczne z FaceEmbedder.verify)."""
+        """Cosine-distance verification (same convention as FaceEmbedder.verify)."""
         distance = float(np.clip(1.0 - np.dot(emb_a, emb_b), 0.0, 2.0))
         return VerificationResult(
             is_match=distance <= threshold,
@@ -299,10 +289,10 @@ class SwinFaceEmbedder:
             threshold=threshold,
         )
 
-    # ── Wewnętrzne ────────────────────────────────────────────────────────
+    # --- Internal ---
 
     def _forward(self, bgr_crop: np.ndarray) -> dict:
-        """BGR crop → forward pass → słownik wyników SwinFace."""
+        """BGR crop → forward() → raw head dict."""
         assert self._model is not None
         tensor = _preprocess(bgr_crop, self._device)
         with torch.no_grad():
@@ -310,7 +300,7 @@ class SwinFaceEmbedder:
         return output
 
 
-# ─── Preprocessing ───────────────────────────────────────────────────────────
+# --- Preprocessing ---
 
 
 def preprocess_swinface(bgr_crop: np.ndarray, device: torch.device) -> torch.Tensor:
@@ -325,16 +315,14 @@ def preprocess_swinface(bgr_crop: np.ndarray, device: torch.device) -> torch.Ten
     return t
 
 
-# alias wewnętrzny
+# internal alias
 _preprocess = preprocess_swinface
 
 
-# ─── Helper ──────────────────────────────────────────────────────────────────
+# --- Helper ---
 
 
 def _binary_prob(logits: torch.Tensor) -> float:
-    """
-    Zwraca prawdopodobieństwo klasy '1' (True) z tensorka (2,) logitów.
-    """
+    """Probability of the positive class for a 2-logit head."""
     probs = torch.softmax(logits.cpu().float(), dim=0).numpy()
     return float(probs[1]) if len(probs) >= 2 else 0.0

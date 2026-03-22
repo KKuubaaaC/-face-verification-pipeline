@@ -336,9 +336,9 @@ def on_upload_verify(
 def build_ui() -> gr.Blocks:
     with gr.Blocks(title="Face Verification & Anti-Spoofing") as demo:
         gr.Markdown(
-            "### Weryfikacja twarzy (snapshot)\n"
-            "Wgraj zdjęcie lub zrób fotografię kamerą, a następnie kliknij "
-            "**Run verification**. Tryb live stream jest wyłączony."
+            "### Face verification (snapshot)\n"
+            "Upload a photo or capture one with the webcam, then click **Run verification**. "
+            "Continuous live streaming is disabled in this mode."
         )
 
         with gr.Row():

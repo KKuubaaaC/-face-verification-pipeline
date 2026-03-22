@@ -49,7 +49,7 @@ class MultipleFacesError(ValueError):
     """Raised when more than one face is detected in a single image."""
 
     def __init__(self, path: str, count: int) -> None:
-        super().__init__(f"Wykryto {count} twarzy w obrazie: {path}")
+        super().__init__(f"Detected {count} faces in image: {path}")
         self.path = path
         self.count = count
 
@@ -79,29 +79,29 @@ class FaceDetectorBatch:
     def __init__(self, model_pack: str = "buffalo_l") -> None:
         from insightface.app import FaceAnalysis  # noqa: PLC0415
 
-        logger.info("Ładowanie modeli insightface (%s)…", model_pack)
+        logger.info("Loading insightface models (%s)...", model_pack)
         self._app = FaceAnalysis(
             name=model_pack,
             allowed_modules=["detection", "landmark_2d_106"],
             providers=["CPUExecutionProvider"],
         )
-        # det_size=(640,640) — standard; 2d106det działa na całym obrazie,
-        # więc detekcja na 112×112 też wystarczy po downscale.
+        # det_size=(640,640) is standard; 2d106det runs on the full tensor so
+        # 112×112 inputs still work after internal scaling.
         self._app.prepare(ctx_id=0, det_size=(640, 640))
-        logger.info("FaceDetectorBatch gotowy.")
+        logger.info("FaceDetectorBatch ready.")
 
-    # ── Publiczne API ────────────────────────────────────────────────────
+    # --- Public API ---
 
     def process_image(self, img_path: Path) -> tuple[np.ndarray | None, float]:
         """
-        Wykrywa twarz, wyrównuje, zwraca (aligned_crop, det_score).
+        Detect face, align, return (aligned_crop, det_score).
 
-        Raises MultipleFacesError jeśli wykryto >1 twarz.
-        Zwraca (None, 0.0) jeśli brak twarzy.
+        Raises MultipleFacesError if more than one face is found.
+        Returns (None, 0.0) if no face.
         """
         img = cv2.imread(str(img_path))
         if img is None:
-            raise FileNotFoundError(f"Nie można wczytać obrazu: {img_path}")
+            raise FileNotFoundError(f"Cannot read image: {img_path}")
 
         faces = self._app.get(img)
 
@@ -109,30 +109,30 @@ class FaceDetectorBatch:
             raise MultipleFacesError(str(img_path), len(faces))
 
         if len(faces) == 0:
-            # Fallback: traktuj cały obraz jako proxy twarzy
+            # Fallback: treat whole image as face proxy
             aligned, score = self._proxy_align(img, img_path)
             return aligned, score
 
         face = faces[0]
         lm106 = getattr(face, "landmark_2d_106", None)
         if lm106 is None:
-            logger.warning("Brak landmark_2d_106 dla %s — używam proxy.", img_path.name)
+            logger.warning("Missing landmark_2d_106 for %s — using proxy.", img_path.name)
             return self._proxy_align(img, img_path)
 
         kps5 = lm106[_KPS5_INDICES].astype(np.float32)  # (5, 2)
         aligned = _norm_crop(img, kps5)
         return aligned, float(face.det_score)
 
-    # ── Wewnętrzne ───────────────────────────────────────────────────────
+    # --- Internal ---
 
     def _proxy_align(self, img: np.ndarray, img_path: Path) -> tuple[np.ndarray | None, float]:
         """
-        _FaceProxy trick: traktujemy cały obraz jako bbox i uruchamiamy
-        tylko landmark_2d_106 bez detekcji.  Działa dla pre-cropped 112×112.
+        _FaceProxy: treat the full image as a bbox and run landmark_2d_106 only.
+        Works for pre-cropped 112×112 cells.
         """
 
         h, w = img.shape[:2]
-        # Skonstruuj sztuczny obiekt Face z bbox pokrywającym cały obraz
+        # Synthetic Face covering the whole frame
         import insightface.app.common as common  # noqa: PLC0415
 
         proxy = common.Face(
@@ -147,30 +147,31 @@ class FaceDetectorBatch:
             embedding=None,
         )
 
-        # Pobieramy model 2d106det bezpośrednio
         lm_model = self._get_lm_model()
         if lm_model is None:
-            logger.warning("Brak modelu 2d106det — zwracam crop bez alignmentu.")
+            logger.warning("2d106det model missing — returning resized crop.")
             resized = cv2.resize(img, (112, 112), interpolation=cv2.INTER_LINEAR)
             return resized, 0.0
 
         lm_model.get(img, proxy)
         lm106 = getattr(proxy, "landmark_2d_106", None)
         if lm106 is None:
-            logger.warning("Proxy: brak landmarków — zwracam resize.")
+            logger.warning("Proxy: no landmarks — returning resize.")
             resized = cv2.resize(img, (112, 112), interpolation=cv2.INTER_LINEAR)
             return resized, 0.0
 
         kps5 = lm106[_KPS5_INDICES].astype(np.float32)
         aligned = _norm_crop(img, kps5)
-        return aligned, 0.0  # brak det_score w proxy mode
+        return aligned, 0.0  # no det_score in proxy mode
 
     def _get_lm_model(self):
-        """Zwraca instancję modelu 2d106det z FaceAnalysis.models."""
+        """Return the 2d106det module from FaceAnalysis.models."""
         for model in self._app.models.values():
-            if hasattr(model, "taskname") and "landmark_2d_106" in str(getattr(model, "taskname", "")):
+            if hasattr(model, "taskname") and "landmark_2d_106" in str(
+                getattr(model, "taskname", "")
+            ):
                 return model
-        # Fallback: szukaj po nazwie
+        # Fallback: search by module name
         for name, model in self._app.models.items():
             if "106" in str(name):
                 return model
@@ -181,7 +182,7 @@ class FaceDetectorBatch:
 
 
 def _norm_crop(img: np.ndarray, kps5: np.ndarray, image_size: int = 112) -> np.ndarray:
-    """norm_crop wrapper — wywołuje insightface.utils.face_align.norm_crop."""
+    """Thin wrapper around insightface.utils.face_align.norm_crop."""
     from insightface.utils.face_align import norm_crop  # noqa: PLC0415
 
     return norm_crop(img, kps5, image_size=image_size, mode="arcface")
@@ -202,7 +203,7 @@ def _build_dedup_map(
     paths: list[Path],
 ) -> tuple[list[Path], dict[Path, Path]]:
     """
-    Zwraca (unique_paths, duplicate_map).
+    Return (unique_paths, duplicate_map).
 
     duplicate_map: {dup_path → canonical_path}
     """
@@ -226,32 +227,31 @@ def _build_dedup_map(
 
 def _load_dataset(dataset_dir: Path) -> list[Path]:
     """
-    Wczytuje listę ścieżek obrazów z img.list.
+    Load image paths from img.list.
 
-    Ścieżki w img.list to np. 'data/lfw/imgs/0.jpg' — używamy tylko nazwy pliku
-    i szukamy go w <dataset_dir>/imgs/.
+    Each line may be a long path; only the basename is used under <dataset_dir>/imgs/.
     """
     list_file = dataset_dir / "img.list"
     imgs_dir = dataset_dir / "imgs"
 
     if not list_file.exists():
-        raise FileNotFoundError(f"Brak img.list w: {dataset_dir}")
+        raise FileNotFoundError(f"Missing img.list in: {dataset_dir}")
 
     paths: list[Path] = []
     with open(list_file) as f:
         for line in f:
-            name = Path(line.strip()).name  # tylko nazwa pliku (0.jpg)
+            name = Path(line.strip()).name
             p = imgs_dir / name
             if p.exists():
                 paths.append(p)
             else:
-                logger.warning("Plik nie istnieje: %s", p)
+                logger.warning("Missing file: %s", p)
 
-    logger.info("Wczytano %d ścieżek z %s", len(paths), list_file)
+    logger.info("Loaded %d paths from %s", len(paths), list_file)
     return paths
 
 
-# ─── Główna funkcja ──────────────────────────────────────────────────────────
+# --- Batch runner ---
 
 
 def run_batch(
@@ -261,12 +261,12 @@ def run_batch(
     stop_on_multiple_faces: bool = False,
 ) -> list[AlignResult]:
     """
-    Przetwarza wszystkie obrazy z podanych datasetów.
+    Process every image listed for the given datasets.
 
     datasets : {"lfw": Path(...), "agedb": Path(...)}
-    out_dir  : katalog wyjściowy (np. data/aligned)
+    out_dir  : output root (e.g. data/aligned)
 
-    Zwraca listę AlignResult; zapisuje detection_stats.csv.
+    Returns AlignResult rows and writes detection_stats.csv.
     """
     detector = FaceDetectorBatch()
     all_results: list[AlignResult] = []
@@ -278,7 +278,7 @@ def run_batch(
         unique_paths, dup_map = _build_dedup_map(paths)
         dup_count = len(dup_map)
         logger.info(
-            "%s: %d obrazów, %d unikalnych, %d duplikatów (%.1f%%)",
+            "%s: %d images, %d unique, %d duplicates (%.1f%%)",
             dataset_name,
             len(paths),
             len(unique_paths),
@@ -289,7 +289,7 @@ def run_batch(
         save_dir = out_dir / dataset_name
         save_dir.mkdir(parents=True, exist_ok=True)
 
-        # ── Przetwarzaj unikalne obrazy ───────────────────────────────
+        # --- Process unique images ---
         unique_results: dict[Path, AlignResult] = {}
 
         for idx, img_path in enumerate(unique_paths, 1):
@@ -324,13 +324,13 @@ def run_batch(
                 result.error = str(exc)
 
             except Exception as exc:
-                logger.error("Błąd przetwarzania %s: %s", img_path, exc)
+                logger.error("Processing error %s: %s", img_path, exc)
                 result.error = str(exc)
 
             unique_results[img_path] = result
             all_results.append(result)
 
-        # ── Kopiuj wyniki dla duplikatów ──────────────────────────────
+        # --- Copy aligned crops for duplicate hashes ---
         for dup_path, canonical_path in dup_map.items():
             canonical_result = unique_results.get(canonical_path)
             dup_out_p = save_dir / dup_path.name
@@ -351,14 +351,14 @@ def run_batch(
 
         detected = sum(1 for r in unique_results.values() if r.face_detected)
         logger.info(
-            "%s: wykryto %d / %d unikalnych (%.1f%%)",
+            "%s: detected %d / %d unique (%.1f%%)",
             dataset_name,
             detected,
             len(unique_paths),
             100 * detected / max(len(unique_paths), 1),
         )
 
-    # ── Zapisz detection_stats.csv ────────────────────────────────────────
+    # --- Write detection_stats.csv ---
     stats_path = out_dir / "detection_stats.csv"
     with open(stats_path, "w", newline="") as f:
         writer = csv.DictWriter(
@@ -377,7 +377,7 @@ def run_batch(
                 }
             )
 
-    logger.info("Zapisano %d wierszy → %s", len(all_results), stats_path)
+    logger.info("Wrote %d rows → %s", len(all_results), stats_path)
     return all_results
 
 
@@ -390,24 +390,24 @@ def _parse_args() -> argparse.Namespace:
         "--lfw",
         type=Path,
         default=Path("/Users/jakub/Desktop/folder bez nazwy 2/lfw"),
-        help="Ścieżka do folderu LFW (zawiera img.list i imgs/)",
+        help="Path to LFW folder (contains img.list and imgs/)",
     )
     p.add_argument(
         "--agedb",
         type=Path,
         default=Path("/Users/jakub/Desktop/folder bez nazwy 2/agedb"),
-        help="Ścieżka do folderu AgeDB (zawiera img.list i imgs/)",
+        help="Path to AgeDB folder (contains img.list and imgs/)",
     )
     p.add_argument(
         "--out",
         type=Path,
         default=Path("data/aligned"),
-        help="Katalog wyjściowy dla wyrównanych cropów i detection_stats.csv",
+        help="Output directory for aligned crops and detection_stats.csv",
     )
     p.add_argument(
         "--stop-on-multiple-faces",
         action="store_true",
-        help="Przerwij przetwarzanie jeśli wykryto >1 twarz (domyślnie: zapisz błąd i kontynuuj)",
+        help="Abort if >1 face is detected (default: log error and continue)",
     )
     p.add_argument(
         "--log-level",
@@ -429,15 +429,15 @@ def main() -> None:
     if args.lfw.exists():
         datasets["lfw"] = args.lfw
     else:
-        logger.warning("Folder LFW nie istnieje: %s — pomijam.", args.lfw)
+        logger.warning("LFW folder missing: %s — skipping.", args.lfw)
 
     if args.agedb.exists():
         datasets["agedb"] = args.agedb
     else:
-        logger.warning("Folder AgeDB nie istnieje: %s — pomijam.", args.agedb)
+        logger.warning("AgeDB folder missing: %s — skipping.", args.agedb)
 
     if not datasets:
-        logger.error("Brak dostępnych datasetów. Użyj --lfw / --agedb.")
+        logger.error("No datasets available. Pass --lfw / --agedb.")
         sys.exit(1)
 
     results = run_batch(
@@ -449,9 +449,9 @@ def main() -> None:
     detected = sum(1 for r in results if r.face_detected)
     errors = sum(1 for r in results if r.error)
     print(
-        f"\nPodsumowanie: {len(results)} obrazów, "
-        f"{detected} wykrytych ({100 * detected / max(len(results), 1):.1f}%), "
-        f"{errors} błędów."
+        f"\nSummary: {len(results)} images, "
+        f"{detected} faces ({100 * detected / max(len(results), 1):.1f}%), "
+        f"{errors} errors."
     )
     print(f"CSV: {args.out / 'detection_stats.csv'}")
 

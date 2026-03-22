@@ -1,0 +1,4 @@
+Model,Dataset,AUC,EER (%),TAR@FAR=1e-2,TAR@FAR=1e-3,TAR@FAR=1e-4,Params (M),Input,Loss
+ArcFace (ResNet-50),LFW (ref.),0.9997,0.3,0.999,0.997,0.994,65.0,112×112,ArcFace
+"SwinFace (Swin-T, paper)",LFW (paper),0.9998,0.2,0.9993,0.9975,0.9952,28.3,112×112,AMS (CosFace)
+SwinFace (Swin-T),Synthetic (demo),1.0,0.0,1.0,1.0,1.0,67.8,112×112,AMS (CosFace)

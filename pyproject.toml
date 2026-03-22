@@ -1,12 +1,12 @@
 [project]
 name = "nask-face-recognition"
 version = "0.1.0"
-description = "Face Recognition Research Pipeline — NASK Computer Vision Expert Assessment"
+description = "Face Recognition Research Pipeline"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 license = {text = "MIT"}
 authors = [
-    {name = "Jakub", email = "jakub@example.com"},
+    {name = "Jakub", email = "cisekjakub@wp.pl"},
 ]
 
 dependencies = [
@@ -64,15 +64,23 @@ dev = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build.targets.wheel]
+packages = ["nask_face_recognition"]
+
 [tool.ruff]
 target-version = "py310"
 line-length = 120
+extend-exclude = [
+    "notebooks",
+    "space-main",
+    "space-liveness",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
     "ruff>=0.3",
     "pre-commit>=3.6",
     "nbstripout>=0.7",

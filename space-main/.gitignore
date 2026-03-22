@@ -1,6 +1,21 @@
-# Nie wrzucaj ciężkich wag do Space (limit 1 GB) — pobierane z HF Hub przy starcie (SWINFACE_HF_REPO).
-models/swinface.pt
+# Local environment (never upload to Hugging Face — Space installs from requirements.txt)
+.venv/
+venv/
+.env
+.env.*
+
+# Python / tooling caches
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+
+# HF / local caches (optional)
 .cache/
-models/models/
+
+# OS
+.DS_Store

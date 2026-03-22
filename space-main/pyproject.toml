@@ -1,0 +1,79 @@
+[project]
+name = "face-verification"
+version = "0.1.0"
+description = "Face verification research app — ArcFace, ViT, SwinFace embedding comparison with XAI"
+readme = "README.md"
+requires-python = ">=3.10,<3.12"
+dependencies = [
+    "deepface>=0.0.92",
+    "gradio>=6.9.0",
+    "huggingface_hub>=0.30.0",
+    "insightface>=0.7.3",
+    "numpy>=1.26,<2.3",
+    "onnxruntime>=1.18,<1.24",
+    "opencv-python-headless>=4.10",
+    "pandas>=2.2.0,<3.0",
+    "scikit-image>=0.24.0",
+    "scipy>=1.13",
+    "tf-keras>=2.16.0",
+    "timm>=1.0",
+    "torch>=2.2,<3",
+    "torchvision>=0.17,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.11.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+src = ["src"]
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "W",
+    "F",
+    "I",
+    "N",
+    "UP",
+    "B",
+    "SIM",
+    "TCH",
+    "RUF",
+    "PLC",
+    "PLE",
+]
+ignore = [
+    "E501",
+    "B008",
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["src"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/main.py" = ["SIM117"]
+"src/pad/liveness_check.py" = ["SIM108"]
+"src/pad/mobilenet_gradcam.py" = ["N812"]
+"src/xai/explainability.py" = ["N812"]
+"src/pad/physical_features.py" = ["N806"]
+"src/pipeline.py" = ["TC002"]
+"src/vision/embedder.py" = ["SIM108"]
+"src/vision/swinface_embedder.py" = ["RUF012"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

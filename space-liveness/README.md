@@ -1,58 +1,99 @@
 ---
-title: Face Liveness — Anti-Spoofing Demo
+title: Face verification & attack detection
+colorFrom: red
+colorTo: blue
 sdk: gradio
 sdk_version: 6.9.0
+python_version: "3.10"
 app_file: app.py
 pinned: false
 ---
 
-# Face Liveness — Anti-Spoofing Demo
+# Face verification & attack detection
 
-Gradio application for **face liveness verification** using **DeepFace** with **anti-spoofing** enabled (`anti_spoofing=True`). You upload a **single face image**; the pipeline runs spoof detection first, then (if the face is accepted as live) **Facenet512**-based identity search against a reference gallery. The UI surfaces a discrete outcome:
+**Live Space:** [KKUBBAACC/attack-detection](https://huggingface.co/spaces/KKUBBAACC/attack-detection)
 
-| User-facing label | Internal status | Meaning |
-| --- | --- | --- |
-| **VERIFIED** | `VERIFIED_MATCH` | Live face matches a reference identity in the database |
-| **SPOOF** | `SPOOF_DETECTED` | Anti-spoofing model rejected the frame (attack / presentation) |
-| **UNAUTHORIZED** | `UNAUTHORIZED` | Live face detected but no matching identity in the reference set |
+Gradio app that checks **who you are** (match against a small face gallery) and **whether the face looks live** (anti-spoofing). It runs two image sets side by side for demos and benchmarks.
 
-Additional cases (e.g. no face, errors) are reported in the UI and logged; see `src/gradio_app.py` for the full list.
+## What you see in the UI
 
-**Live demo (Hugging Face):** [https://huggingface.co/spaces/KKUBBAACC/adversarial-attack-detection](https://huggingface.co/spaces/KKUBBAACC/adversarial-attack-detection)
+- **First run** can take on the order of **10-15 seconds** while models load.
+- **Set** (radio): switch between the **reference** photos (should match the gallery) and the **attack** photos (spoof / impostor-style probes).
+- **File**: pick an image from that set.
+- **Run example**: left = input image, right = same image with a **status label** and **face bounding box** (color encodes outcome).
+- **Run benchmark**: walks **all** images in both folders, fills a **results table**, prints a **short accuracy summary**, and shows a **gallery of up to 8** annotated images (first rows from each set).
 
-![Demo](screenshot.png)
+### Table columns
 
-## Models available
+| Column | Meaning |
+|--------|---------|
+| **set** | Which folder the image came from (reference vs attack). |
+| **file** | Filename. |
+| **status** | What the pipeline returned for that image. |
+| **expected** | Ground truth for scoring the benchmark. |
+| **match** | Whether **status** satisfied the expectation (yes/no). |
 
-| Component | Role |
-| --- | --- |
-| **DeepFace anti-spoofing** | Presentation attack detection (real vs spoof score before verification) |
-| **Facenet512 + DeepFace.find** | Face embedding and nearest-neighbour match against `db/ja/` (RetinaFace detector) |
+### Status values
 
-Reference faces are read from `db/ja/` (see below). If the folder is empty, verification will usually return **UNAUTHORIZED** for live images.
+| Status | Meaning |
+|--------|---------|
+| **VERIFIED_MATCH** | Anti-spoof passed (or skipped) and **DeepFace.find** found a match in the gallery (label + distance on the overlay). |
+| **SPOOF_DETECTED** | Anti-spoofing flagged a presentation attack (e.g. screen / print). |
+| **UNAUTHORIZED** | Live-looking face but **no** match in the gallery. |
+| **NO_FACE_FOUND** | No usable face after trying several detectors. |
+| **ERROR** | Processing failed (e.g. exception during search). |
 
-## Run locally
+**Benchmark scoring:** reference images expect **VERIFIED_MATCH**. Attack images count as correct if status is **UNAUTHORIZED** **or** **SPOOF_DETECTED** (both mean “did not wrongly accept” the probe).
 
-```bash
-pip install -r requirements.txt
-python app.py
+## How it works (technical)
+
+Entry point: **`app.py`** → **`src/gradio_app.py`** → **`src/ui/hf_layout.py`** / **`src/ui/hf_handlers.py`**.
+
+1. **Face crop:** **DeepFace** with detector fallback (**RetinaFace** → **OpenCV** → **MTCNN**), **anti-spoofing** when the runtime supports it (otherwise it continues without spoof scores).
+2. If spoofing says “fake” → **SPOOF_DETECTED** (no identity search).
+3. Else **DeepFace.find** with **Facenet512** against the enrolled folder **`db/ja/`**.
+4. Match / no-match → **VERIFIED_MATCH** or **UNAUTHORIZED**.
+
+Put enrollment photos in **`db/ja/`** (one or more faces per identity). Put attack / spoof-style probes in **`db/attack/`**. Optional sample assets can sit in **`examples/`** and be copied into `db/` as needed.
+
+## Data layout
+
+```
+db/ja/       # Reference gallery used by DeepFace.find
+db/attack/   # Images used only in the “attack” set for benchmarks / demos
+examples/    # Optional sample images
 ```
 
-Sample images are under `examples/`. Add reference photos to `db/ja/` for identity **Kuba** (or extend the app as needed).
+## Project layout (Space-relevant)
 
-### Run with Docker
-
-Build and run from this directory (`space-liveness/`). Default port **7860**.
-
-```bash
-docker build -t face-liveness-demo .
-docker run --rm -p 7860:7860 face-liveness-demo
+```
+app.py
+requirements.txt
+src/
+  gradio_app.py
+  ui/
+    hf_strings.py    # UI copy
+    hf_layout.py     # Gradio layout
+    hf_handlers.py   # DeepFace verification + benchmark
 ```
 
-Open `http://127.0.0.1:7860`. On Hugging Face, `PORT` or `GRADIO_SERVER_PORT` is set automatically; `app.py` reads both.
+Other files under `src/` (extra scripts, tests, alternate pipelines) are **not** what the Hugging Face Space runs by default.
 
-## Deploy to Hugging Face Spaces
+## Development
 
-Official guide: [Spaces documentation](https://huggingface.co/docs/hub/spaces) (Gradio SDK, secrets, hardware).
+Python **3.10-3.11**, dependencies in **`pyproject.toml`**. For Spaces, refresh pinned deps:
 
-**Note:** This stack pulls **TensorFlow** (via `tf-keras` / DeepFace) and **PyTorch**; the image is large and cold starts can be slow. For production Spaces, consider a **Docker Space** and enough CPU/RAM, or trim dependencies if you fork a minimal build.
+```bash
+uv export --no-dev --no-hashes --no-editable -o requirements.txt
+```
+
+Remove a standalone `.` line from the export if it appears. Run from the repo root so `import src.*` resolves.
+
+```bash
+uv sync --all-extras
+uv run ruff check .
+uv run pytest
+```
+## License
+
+This project is intended for **research and educational** purposes.

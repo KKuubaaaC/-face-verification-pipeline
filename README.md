@@ -73,7 +73,7 @@ jupyter notebook notebooks/
 cd space-main && python app.py
 ```
 
-**Hugging Face Spaces:** [face verification (space-main)](https://huggingface.co/spaces/KKUBBAACC/face_verification) · [liveness / anti-spoofing (space-liveness)](https://huggingface.co/spaces/KKUBBAACC/adversarial-attack-detection)
+**Hugging Face Spaces:** [face verification (space-main)](https://huggingface.co/spaces/KKUBBAACC/verification) · [liveness / anti-spoofing (space-liveness)](https://huggingface.co/spaces/KKUBBAACC/attack-detection)
 
 ### SwinFace sources (`third_party/swinface`)
 

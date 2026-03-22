@@ -1,37 +1,23 @@
 """
-verify_liveness — główna funkcja weryfikacji żywotności twarzy (single-image PAD).
+Single-image face liveness scoring (distinct from sequential :class:`PADPipeline`).
 
-Pipeline (zgodnie z 01_detect_align.pdf + spec modułów):
+Pipeline overview:
 
-  1. Detekcja i wyrównanie (FaceDetector / buffalo_l + 2d106det)
-     Wynik: aligned_crop (112×112 BGR).  Jeśli brak twarzy → FAIL.
+1. **Detect + align** with :class:`src.vision.detector.FaceDetector` (``buffalo_l`` / 2d106),
+   yielding a 112×112 BGR ``aligned_crop`` (or proxy-align fallback for tight crops).
 
-  2. Analiza fizyczna (PhysicalFeatureExtractor):
-       LBP uniform (skimage, P=8, R=1) → entropia histogramu
-         Naturalna skóra: dużo równomiernych wzorców → wyższa entropia
-         Wydruk / ekran: dominacja kilku wzorców → niższa entropia
-       FFT log-amplituda → energia wysokich częstotliwości
-         (kalibrowana przez MoireDetector z istniejącymi progami)
+2. **Physical cues** via :class:`PhysicalFeatureExtractor` and :class:`MoireDetector`:
+   LBP histogram entropy, FFT moiré score, specular ratio.
 
-  3. AntiSpoofingModel (MobileNetV2GradCAM):
-       Grad-CAM z warstwy out_relu (features[-1]) → mapa (7×7 → 112×112)
-       Region scoring (z PDF §9):
-         Real score  ↑: Eyes (×0.5) + Mouth (×0.3) + Nose (×0.2)
-         Spoof score ↑: krawędzie (Top/Bottom/Left/Right)
+3. **MobileNetV2 Grad-CAM** branch (optional deep cue) with region scoring
+   (eyes / mouth / nose vs edges).
 
-  4. Łączenie score'ów:
-       physical_score = 0.50·LBP_entropy + 0.35·moire_live + 0.15·specular_live
-       dl_score       = gcam.real_score  (∈ [0, 1])
-       liveness_score = 0.40·physical + 0.60·dl
+4. **Fusion:** weighted blend of physical and deep scores → ``liveness_score`` in ``[0, 1]``.
 
-  5. Decyzja:
-       liveness_score >= threshold → is_live=True  (Live)
-       liveness_score <  threshold → is_live=False (Security Alert)
+5. **Decision:** ``liveness_score >= threshold`` ⇒ ``is_live=True``.
 
-Kalibracja empiryczna (LFW twarze 112×112):
-  LBP entropy_norm ≈ 0.46  |  moire_score ≈ 0.54 (próg 0.72)  |  specular ≈ 0.076
-  → physical_score ≈ 0.41  |  dl_score ≈ 0.4–0.6 (zależnie od twarzy)
-  → liveness_score ≈ 0.40 (typowa żywa twarz przy threshold=0.1625)
+Empirical notes in code comments refer to sample stats on aligned LFW-style crops; tune
+thresholds for your deployment.
 """
 
 from __future__ import annotations
@@ -51,47 +37,53 @@ from src.pad.mobilenet_gradcam import MobileNetV2GradCAM
 from src.pad.physical_features import PhysicalFeatureExtractor
 from src.vision.detector import FaceDetector
 
-# Indeksy 5 punktów kluczowych z modelu 2d106det (identyczne z face_detector_batch.py)
+# Five keypoint indices from 2d106det (same as face_detector_batch.py)
 _KPS5_INDICES = [38, 88, 86, 52, 61]
 
 logger = logging.getLogger(__name__)
 
-# ─── Progi i wagi ─────────────────────────────────────────────────────────────
-DEFAULT_THRESHOLD: float = 0.1625  # EER threshold z projektu NASK
+# --- Thresholds and weights ---
+DEFAULT_THRESHOLD: float = 0.1625  # project EER-style operating point
 
-_W_PHYSICAL: float = 0.40  # waga komponentu fizycznego (LBP + FFT)
-_W_DL: float = 0.60  # waga komponentu DL (MobileNetV2 Grad-CAM)
+_W_PHYSICAL: float = 0.40  # physical branch (LBP + FFT)
+_W_DL: float = 0.60  # MobileNetV2 Grad-CAM branch
 
-# Wagi wewnątrz physical_score
+# Weights inside physical_score
 _W_LBP: float = 0.50
 _W_MOIRE: float = 0.35
 _W_SPECULAR: float = 0.15
 
-# ─── Komunikaty ───────────────────────────────────────────────────────────────
+# --- User-facing messages ---
 _MSG_LIVE = "Liveness Verified: Live face detected."
 _MSG_SPOOF = "Security Alert: Presentation Attack Detected"
 _MSG_NO_FACE = "No face detected in the image."
 _MSG_UNCERTAIN = "Liveness check inconclusive — score near threshold."
 
 
-# ─── Dataclass wynikowy ───────────────────────────────────────────────────────
+# --- Result dataclass ---
 
 
 @dataclass
 class LivenessResult:
     """
-    Pełny wynik weryfikacji żywotności.
+    Output of :func:`verify_liveness`.
 
-    Atrybuty
-    --------
-    is_live          : True = żywa twarz, False = atak prezentacyjny
-    liveness_score   : ∈ [0, 1] — wyższy = bardziej live
-    physical_score   : komponent LBP + FFT
-    dl_score         : komponent MobileNetV2 Grad-CAM (real_score)
-    gradcam_overlay  : (112, 112, 3) RGB uint8 — heatmapa Grad-CAM na cropsie
-    aligned_crop     : (112, 112, 3) BGR lub None (brak twarzy)
-    message          : czytelny komunikat do Gradio
-    details          : słownik szczegółowych metryk diagnostycznych
+    Attributes
+    ----------
+    is_live
+        ``True`` if the fused score passes the threshold (live presentation).
+    liveness_score
+        Fused score in ``[0, 1]`` (higher → more likely live).
+    physical_score / dl_score
+        Physical (LBP/FFT/specular) vs Grad-CAM branch contributions.
+    gradcam_overlay
+        RGB visualization (e.g. 112×112) for UI.
+    aligned_crop
+        BGR aligned face patch or ``None`` if no face.
+    message
+        Short status string for UIs.
+    details
+        Flat dict of diagnostic floats (when requested).
     """
 
     is_live: bool
@@ -104,12 +96,12 @@ class LivenessResult:
     details: dict[str, float] = field(default_factory=dict)
 
 
-# ─── Lazy singletons (reuse między wywołaniami Gradio) ───────────────────────
+# --- Lazy singletons (reuse across Gradio calls) ---
 
 _detector: FaceDetector | None = None
 _feat_ext: PhysicalFeatureExtractor | None = None
 _gcam: MobileNetV2GradCAM | None = None
-_moire_det: MoireDetector = MoireDetector()  # bezstanowy
+_moire_det: MoireDetector = MoireDetector()  # stateless
 
 
 def _get_detector() -> FaceDetector:
@@ -133,7 +125,7 @@ def _get_gcam() -> MobileNetV2GradCAM:
     return _gcam
 
 
-# ─── Główna funkcja ───────────────────────────────────────────────────────────
+# --- Main API ---
 
 
 def verify_liveness(
@@ -143,34 +135,32 @@ def verify_liveness(
     return_details: bool = True,
 ) -> LivenessResult:
     """
-    Weryfikuje żywotność twarzy na pojedynczym obrazie.
+    Run single-image liveness on a BGR frame.
 
-    Parametry
-    ---------
-    image     : (H, W, 3) BGR uint8  — obraz wejściowy (dowolna rozdzielczość)
-    threshold : próg decyzyjny [0, 1]; domyślnie EER = 0.1625
-                liveness_score >= threshold → Live
-    return_details : czy zwracać szczegółowy słownik diagnostyczny
+    Parameters
+    ----------
+    image
+        ``(H, W, 3)`` BGR ``uint8`` at any resolution.
+    threshold
+        Decision threshold in ``[0, 1]`` (default ``0.1625`` matches project EER note).
+    return_details
+        When ``True``, populate ``details`` with per-cue metrics.
 
-    Zwraca
-    ------
-    LivenessResult z:
-      - is_live, liveness_score, physical_score, dl_score
-      - gradcam_overlay (112×112 RGB) — gotowy do gr.Image w Gradio
-      - aligned_crop (112×112 BGR)
-      - message (string)
-      - details (dict z metrykami)
+    Returns
+    -------
+    LivenessResult
+        Scores, optional ``aligned_crop``, RGB ``gradcam_overlay``, and ``message``.
     """
     if image is None or image.size == 0:
-        logger.warning("verify_liveness: pusty obraz wejściowy.")
+        logger.warning("verify_liveness: empty input image.")
         return _error_result(_MSG_NO_FACE, np.zeros((112, 112, 3), dtype=np.uint8))
 
-    # ── Krok 1: Detekcja i wyrównanie ─────────────────────────────────────────
+    # --- Step 1: detection + alignment ---
     #
-    # Strategia dwuetapowa (zgodna z 01_detect_align.pdf):
-    #   a) Pełna detekcja (det_10g + 2d106det) — dla normalnych zdjęć z kamerą
-    #   b) Fallback proxy-align (2d106det bez detekcji) — dla pre-cropped 112×112
-    #      Treat full image as bbox → 2d106det wyznacza 106 landmarków bezpośrednio
+    # Two-stage strategy:
+    #   a) Full detector (det_10g + 2d106det) for normal camera frames
+    #   b) Proxy-align fallback (2d106det only) for tight 112×112 crops
+    #      Treat full image as bbox so 2d106det predicts 106 landmarks directly
     #
     detector = _get_detector()
     face = detector.get_largest_face(image)
@@ -178,35 +168,35 @@ def verify_liveness(
     if face is not None:
         aligned_crop: np.ndarray = face.aligned_crop  # (112, 112, 3) BGR
         det_score: float = face.det_score
-        logger.debug("Twarz wykryta (detector): det_score=%.3f  bbox=%s", det_score, face.bbox)
+        logger.debug("Face detected (detector): det_score=%.3f  bbox=%s", det_score, face.bbox)
     else:
-        # Fallback: proxy-align przez 2d106det (dla pre-cropped / małych obrazów)
-        logger.info("verify_liveness: detector nie wykrył twarzy — próba proxy-align (2d106det).")
+        # Fallback: proxy-align via 2d106det for pre-cropped / small images
+        logger.info("verify_liveness: no face from detector — trying proxy-align (2d106det).")
         aligned_crop, det_score = _proxy_align_fallback(image)
         if aligned_crop is None:
-            logger.info("verify_liveness: proxy-align nie powiódł się — brak twarzy.")
+            logger.info("verify_liveness: proxy-align failed — no face.")
             return _error_result(_MSG_NO_FACE, image)
 
-        # Sprawdź czy aligned_crop ma wystarczającą zawartość wizualną.
-        # Wariancja Laplasjanu < 5 → jednorodny obraz (czerń, biel, szum bez krawędzi)
+        # Reject uniform / edge-less crops (blank or noise)
+        # Laplacian variance < 5 → flat image
         gray_check = cv2.cvtColor(aligned_crop, cv2.COLOR_BGR2GRAY)
         lap_var = float(cv2.Laplacian(gray_check, cv2.CV_64F).var())
         if lap_var < 5.0:
             logger.info(
-                "verify_liveness: brak krawędzi (Laplacian var=%.2f) — odrzucam jako pusty obraz.",
+                "verify_liveness: no edges (Laplacian var=%.2f) — rejecting as empty.",
                 lap_var,
             )
             return _error_result(_MSG_NO_FACE, image)
 
-    # ── Krok 2: Analiza fizyczna (PhysicalFeatureExtractor + MoireDetector) ────
+    # --- Step 2: physical cues (PhysicalFeatureExtractor + MoireDetector) ---
     physical_score, phy_details = _compute_physical_score(aligned_crop)
 
-    # ── Krok 3: DL AntiSpoofingModel (MobileNetV2 Grad-CAM) ───────────────────
+    # --- Step 3: MobileNetV2 Grad-CAM ---
     gcam = _get_gcam()
     gcam_result = gcam.analyze(aligned_crop)
     dl_score = gcam_result.real_score  # ∈ [0, 1]
 
-    # ── Krok 4: Liveness score — średnia ważona ────────────────────────────────
+    # --- Step 4: fused liveness score ---
     liveness_score = float(_W_PHYSICAL * physical_score + _W_DL * dl_score)
 
     logger.info(
@@ -217,7 +207,7 @@ def verify_liveness(
         threshold,
     )
 
-    # ── Krok 5: Decyzja ────────────────────────────────────────────────────────
+    # --- Step 5: decision ---
     is_live = liveness_score >= threshold
 
     if is_live:
@@ -225,7 +215,7 @@ def verify_liveness(
     else:
         message = _MSG_SPOOF
 
-    # ── Wynik diagnostyczny ────────────────────────────────────────────────────
+    # --- Diagnostics ---
     details: dict[str, float] = {}
     if return_details:
         details = {
@@ -254,44 +244,35 @@ def verify_liveness(
     )
 
 
-# ─── Obliczenie physical_score ────────────────────────────────────────────────
+# --- physical_score computation ---
 
 
 def _compute_physical_score(
     aligned_crop: np.ndarray,
 ) -> tuple[float, dict[str, float]]:
     """
-    Oblicza fizyczny komponent liveness score z aligned_crop (112×112 BGR).
+    Physical branch of the liveness score from aligned_crop (112×112 BGR).
 
-    Składniki:
-      LBP (uniform, P=8, R=1):
-        Entropia znormalizowanego histogramu Shannon'a.
-        Naturalna skóra ma wyższą entropię (równomierniejszy rozkład wzorców)
-        niż wydruk / ekran (dominacja kilku periodycznych wzorców).
-        Zakres: [0, 1], wyższy = bardziej live.
+    Components:
+      LBP (uniform P=8, R=1): Shannon entropy of the normalized histogram.
+        Live skin tends to higher entropy than print/screen textures.
 
-      FFT (Moiré):
-        Energia poza centrum widma / energia całkowita.
-        Kalibrowane progiem MOIRE_FFT_THRESHOLD = 0.72.
-        Konwertowane na live_score: 0 = powyżej progu, 1 = daleko poniżej progu.
+      FFT (moiré): off-center spectrum energy / total energy vs MOIRE_FFT_THRESHOLD.
 
-      Specular:
-        Udział prześwietlonych pikseli (V > 240 w HSV).
-        Ekrany szklane i wydruki w warunkach oświetleniowych dają wyższe wartości.
-        Konwertowane na live_score: 0 = ekran, 1 = brak speculars.
+      Specular: saturated HSV-V pixels; screens and glare raise this cue.
 
-    Zwraca
-    ------
-    (physical_score ∈ [0,1], dict z metrykami)
+    Returns
+    -------
+    (physical_score in [0, 1], metrics dict)
     """
     feat_ext = _get_feat_ext()
 
-    # LBP — uniform variant (skimage)
+    # LBP — uniform variant (scikit-image)
     lbp_hist = feat_ext.get_lbp_hist(aligned_crop)  # (59,) float32, sum=1
     lbp_entropy = float(-np.sum(lbp_hist * np.log2(lbp_hist + 1e-12)))
     lbp_entropy_norm = float(lbp_entropy / np.log2(len(lbp_hist)))  # ∈ [0,1]
 
-    # FFT + Specular — MoireDetector (kalibrowane progi)
+    # FFT + specular — MoireDetector (thresholded)
     moire_score, lbp_var_256, specular = _moire_det.analyze(aligned_crop)
 
     moire_live = float(max(0.0, 1.0 - moire_score / MOIRE_FFT_THRESHOLD))
@@ -322,24 +303,22 @@ def _compute_physical_score(
     return float(physical_score), details
 
 
-# ─── Helper: proxy-align (fallback dla pre-cropped obrazów) ──────────────────
+# --- Helper: proxy-align for pre-cropped images ---
 
 
 def _proxy_align_fallback(
     image: np.ndarray,
 ) -> tuple[np.ndarray | None, float]:
     """
-    Fallback alignment dla pre-cropped / małych obrazów (np. 112×112 z LFW).
+    Proxy alignment for tight crops (e.g. 112×112 LFW cells), same as face_detector_batch.
 
-    Stosuje trick _FaceProxy z face_detector_batch.py:
-      1. Traktuje cały obraz jako bbox twarzy (bez detekcji det_10g)
-      2. Uruchamia model 2d106det bezpośrednio na całym obrazie
-      3. Wybiera 5 kluczowych punktów (indeksy [38,88,86,52,61])
-      4. Stosuje norm_crop (affine transform → 112×112)
+    Steps:
+      1. Treat the full image as the face bounding box (skip det_10g)
+      2. Run 2d106det on the whole image
+      3. Take five keypoints [38,88,86,52,61]
+      4. norm_crop → 112×112 ArcFace-style patch
 
-    Zgodne z 01_detect_align.pdf — identyczna metoda jak w face_detector_batch.py.
-
-    Zwraca (aligned_crop BGR, det_score=0.0) lub (None, 0.0) przy niepowodzeniu.
+    Returns (aligned BGR, det_score=0.0) or (None, 0.0) on failure.
     """
     try:
         import insightface.app.common as common  # noqa: PLC0415
@@ -348,7 +327,7 @@ def _proxy_align_fallback(
         detector = _get_detector()
         h, w = image.shape[:2]
 
-        # Konstruujemy sztuczny obiekt Face z bbox = cały obraz
+        # Synthetic Face with bbox = full image
         proxy = common.Face(
             bbox=np.array([0, 0, w - 1, h - 1], dtype=np.float32),
             kps=None,
@@ -361,16 +340,16 @@ def _proxy_align_fallback(
             embedding=None,
         )
 
-        # Szukamy modelu 2d106det w załadowanym FaceAnalysis
+        # Locate 2d106det inside the loaded FaceAnalysis stack
         lm_model = None
-        for model in detector._app.models.values():
+        for model in detector.face_analysis.models.values():
             if "landmark_2d_106" in str(getattr(model, "taskname", "")):
                 lm_model = model
                 break
 
         if lm_model is None:
-            logger.warning("proxy_align: brak modelu 2d106det.")
-            # Ostatni fallback: resize do 112×112 bez alignment
+            logger.warning("proxy_align: 2d106det model missing.")
+            # Last resort: plain resize to 112×112
             resized = cv2.resize(image, (112, 112), interpolation=cv2.INTER_LINEAR)
             return resized, 0.0
 
@@ -378,7 +357,7 @@ def _proxy_align_fallback(
         lm106 = getattr(proxy, "landmark_2d_106", None)
 
         if lm106 is None:
-            logger.warning("proxy_align: 2d106det nie zwrócił landmarków.")
+            logger.warning("proxy_align: 2d106det returned no landmarks.")
             resized = cv2.resize(image, (112, 112), interpolation=cv2.INTER_LINEAR)
             return resized, 0.0
 
@@ -387,19 +366,19 @@ def _proxy_align_fallback(
         return aligned, 0.0
 
     except Exception as exc:
-        logger.error("proxy_align_fallback błąd: %s", exc)
-        # Ostateczny fallback: resize bez alignment
+        logger.error("proxy_align_fallback error: %s", exc)
+        # Final fallback: resize only
         try:
             return cv2.resize(image, (112, 112), interpolation=cv2.INTER_LINEAR), 0.0
         except Exception:
             return None, 0.0
 
 
-# ─── Helper: wynik błędu ──────────────────────────────────────────────────────
+# --- Helper: error result ---
 
 
 def _error_result(message: str, image: np.ndarray) -> LivenessResult:
-    """Zwraca LivenessResult oznaczający błąd (brak twarzy / pusty obraz)."""
+    """Build a LivenessResult for missing face / empty input."""
     h, w = image.shape[:2] if image.ndim == 3 else (112, 112)
     rgb = (
         cv2.cvtColor(cv2.resize(image, (w, h)), cv2.COLOR_BGR2RGB)
@@ -407,7 +386,7 @@ def _error_result(message: str, image: np.ndarray) -> LivenessResult:
         else np.zeros((112, 112, 3), dtype=np.uint8)
     )
 
-    # Rysujemy komunikat na overlay
+    # Draw status on overlay
     overlay = rgb.copy()
     cv2.putText(
         overlay,
@@ -432,48 +411,46 @@ def _error_result(message: str, image: np.ndarray) -> LivenessResult:
     )
 
 
-# ─── Formatowanie dla Gradio ──────────────────────────────────────────────────
+# --- Gradio markdown formatting ---
 
 
 def format_liveness_report(result: LivenessResult) -> str:
-    """
-    Formatuje LivenessResult jako czytelny markdown dla gr.Markdown w Gradio.
-    """
-    status = "✅ LIVE" if result.is_live else "🚨 SPOOF DETECTED"
+    """Render ``LivenessResult`` as markdown for ``gr.Markdown``."""
+    status = "LIVE" if result.is_live else "SPOOF DETECTED"
     lines = [
         f"## {status}",
         f"**{result.message}**",
         "",
-        "| Metryka | Wartość |",
-        "|---------|---------|",
-        f"| Liveness Score | `{result.liveness_score:.4f}` |",
+        "| Metric | Value |",
+        "|--------|-------|",
+        f"| Liveness score | `{result.liveness_score:.4f}` |",
         f"| Threshold | `{result.details.get('threshold', DEFAULT_THRESHOLD):.4f}` |",
-        f"| Physical Score (LBP+FFT) | `{result.physical_score:.4f}` |",
-        f"| DL Score (Grad-CAM) | `{result.dl_score:.4f}` |",
+        f"| Physical score (LBP+FFT) | `{result.physical_score:.4f}` |",
+        f"| DL score (Grad-CAM) | `{result.dl_score:.4f}` |",
     ]
 
     if result.details:
         lines += [
             "",
-            "### Szczegóły fizyczne",
-            "| Składnik | Wartość |",
-            "|----------|---------|",
-            f"| LBP Entropy (uniform) | `{result.details.get('lbp_entropy_norm', 0):.4f}` |",
-            f"| FFT Moiré score | `{result.details.get('moire_score', 0):.4f}` |",
+            "### Physical breakdown",
+            "| Component | Value |",
+            "|-----------|-------|",
+            f"| LBP entropy (uniform) | `{result.details.get('lbp_entropy_norm', 0):.4f}` |",
+            f"| FFT moiré score | `{result.details.get('moire_score', 0):.4f}` |",
             f"| Specular ratio | `{result.details.get('specular_ratio', 0):.4f}` |",
             "",
-            "### Grad-CAM (region aktywacji)",
-            "| Region | Aktywacja |",
-            "|--------|-----------|",
+            "### Grad-CAM (region means)",
+            "| Region | Activation |",
+            "|--------|------------|",
         ]
         for region in ["Eyes", "Mouth", "Nose", "Forehead", "Chin/Jaw"]:
             key = f"gradcam_{region}"
             val = result.details.get(key, 0.0)
-            mark = " ⬆ biometryczne" if region in ("Eyes", "Mouth") else ""
+            mark = " (biometric)" if region in ("Eyes", "Mouth") else ""
             lines.append(f"| {region} | `{val:.4f}`{mark} |")
         edge_keys = [k for k in result.details if k.startswith("gradcam_Edge_")]
         if edge_keys:
             edge_mean = np.mean([result.details[k] for k in edge_keys])
-            lines.append(f"| Edge (mean) | `{edge_mean:.4f}` ← spoof sygnał |")
+            lines.append(f"| Edge (mean) | `{edge_mean:.4f}` (spoof cue) |")
 
     return "\n".join(lines)

@@ -1,23 +1,19 @@
 """
-Static test: Face Verification + Anti-Spoofing na zdjęciach.
+Static test: face verification + anti-spoofing on disk images.
 
-Użycie:
-    uv run python src/static_test.py --probe ścieżka/do/zdjecia.jpg
+Usage:
+    uv run python src/static_test.py --probe path/to/image.jpg
 
-Wyniki:
-    - Czy twarz pasuje do bazy db/ja/ (DeepFace.find)
-    - Czy zdjęcie jest live / spoof (DeepFace.analyze z anti-spoofing)
+Output:
+    - Whether the face matches gallery db/ja/ (DeepFace.find)
+    - Whether the image looks live vs spoof (DeepFace with anti-spoofing)
 """
 
 import argparse
-import logging
-import sys
 from pathlib import Path
 
 import pandas as pd
 from deepface import DeepFace
-
-logger = logging.getLogger(__name__)
 
 DB_REAL = str(Path(__file__).parent.parent / "db" / "ja")
 DB_ATTACK = str(Path(__file__).parent.parent / "db" / "attack")
@@ -26,12 +22,12 @@ DB_ATTACK = str(Path(__file__).parent.parent / "db" / "attack")
 def run(probe_path: str) -> None:
     probe = str(Path(probe_path).resolve())
 
-    logger.info("\n%s", "=" * 55)
-    logger.info("  Probe : %s", probe)
-    logger.info("%s", "=" * 55)
+    print(f"\n{'=' * 55}")
+    print(f"  Probe : {probe}")
+    print(f"{'=' * 55}")
 
-    # ── 1. Weryfikacja tożsamości ─────────────────────────────
-    logger.info("\n[1/2] Weryfikacja tożsamości (db/ja/)...")
+    # --- 1. Identity vs db/ja/ ---
+    print("\n[1/2] Identity verification (db/ja/)...")
     try:
         results: list[pd.DataFrame] = DeepFace.find(
             img_path=probe,
@@ -43,20 +39,20 @@ def run(probe_path: str) -> None:
         )
         df = results[0] if results else pd.DataFrame()
         if df.empty:
-            logger.warning("  ✗ Nie znaleziono pasującej twarzy w db/ja/")
+            print("  No matching face in db/ja/")
             verified = False
         else:
             best = df.iloc[0]
             dist = best.get("distance", best.iloc[-1])
-            logger.info("  ✓ Dopasowanie: %s", Path(best["identity"]).name)
-            logger.info("    dystans = %.4f", dist)
+            print(f"  Match: {Path(best['identity']).name}")
+            print(f"    distance = {dist:.4f}")
             verified = True
     except Exception as exc:
-        logger.warning("  ✗ Błąd weryfikacji: %s", exc)
+        print(f"  Verification error: {exc}")
         verified = False
 
-    # ── 2. Anti-Spoofing ──────────────────────────────────────
-    logger.info("\n[2/2] Anti-Spoofing...")
+    # --- 2. Anti-spoofing ---
+    print("\n[2/2] Anti-spoofing...")
     try:
         analysis = DeepFace.extract_faces(
             img_path=probe,
@@ -69,34 +65,29 @@ def run(probe_path: str) -> None:
         spoof_conf = face.get("antispoof_score", None)
 
         if is_real is True:
-            label = "REAL ✓"
+            label = "REAL"
         elif is_real is False:
-            label = "SPOOF ✗"
+            label = "SPOOF"
         else:
             label = "UNKNOWN"
 
-        logger.info("  Wynik: %s", label)
+        print(f"  Result: {label}")
         if spoof_conf is not None:
-            logger.info("  Pewność: %.3f", spoof_conf)
+            print(f"  Confidence: {spoof_conf:.3f}")
 
     except Exception as exc:
-        logger.warning("  ✗ Błąd anti-spoofing: %s", exc)
+        print(f"  Anti-spoof error: {exc}")
         is_real = None
 
-    # ── Podsumowanie ──────────────────────────────────────────
-    logger.info("\n%s", "─" * 55)
-    status = "DOSTĘP PRZYZNANY ✓" if (verified and is_real) else "DOSTĘP ODMÓWIONY ✗"
-    logger.info("  %s", status)
-    logger.info("%s\n", "─" * 55)
+    # --- Summary ---
+    print(f"\n{'─' * 55}")
+    status = "ACCESS GRANTED" if (verified and is_real) else "ACCESS DENIED"
+    print(f"  {status}")
+    print(f"{'─' * 55}\n")
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(message)s",
-        stream=sys.stdout,
-    )
     parser = argparse.ArgumentParser()
-    parser.add_argument("--probe", required=True, help="Ścieżka do testowanego zdjęcia")
+    parser.add_argument("--probe", required=True, help="Path to probe image")
     args = parser.parse_args()
     run(args.probe)

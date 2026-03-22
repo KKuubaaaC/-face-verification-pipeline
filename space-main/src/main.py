@@ -1,9 +1,9 @@
 """
-Gradio UI dla systemu weryfikacji twarzy z liveness detection.
+Gradio UI for face verification with liveness detection.
 
-Zakładki:
-  1. „Weryfikacja Live"    — kamera na żywo, PAD, wizualizacja EAR, wynik weryfikacji
-  2. „Analiza Badawcza"   — wgranie dwóch zdjęć, dystans kosinusowy, porównanie embeddingów
+Tabs:
+  1. Live verification: webcam, PAD, EAR visualization, verification outcome.
+  2. Research comparison: upload two images, cosine distance, embedding comparison.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import cv2
 import gradio as gr
 import numpy as np
 
-# ── ścieżka do src/ na PYTHONPATH ────────────────────────────────────────────
+# Ensure repo root is on PYTHONPATH for `src.*` imports
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.pipeline import VerificationPipeline
@@ -30,30 +30,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-_HF_SPACE_URL: str = "https://huggingface.co/spaces/KKUBBAACC/face_verification"
-
-# ─── Stałe UI ────────────────────────────────────────────────────────────────
+# --- UI constants ---
 _OVERLAY_FONT = cv2.FONT_HERSHEY_SIMPLEX
-_COLOR_OK = (50, 200, 50)  # BGR zielony
-_COLOR_FAIL = (50, 50, 220)  # BGR czerwony
+_COLOR_OK = (50, 200, 50)  # BGR green
+_COLOR_FAIL = (50, 50, 220)  # BGR red
 
-# ─── Lazy init pipeline (HF Spaces) ───────────────────────────────────────────
-# Eager load przy imporcie blokuje start: pobieranie buffalo_l trwa minuty → watchdog
-# ubija kontener zanim Gradio zdąży odpowiedzieć na healthcheck. Pierwsze kliknięcie
-# w UI lub pierwsze użycie ArcFace załaduje modele.
-_pipeline: VerificationPipeline | None = None
+# Eager pipeline init (models load before the UI starts)
+logger.info("Loading InsightFace models; please wait...")
+_pipeline = VerificationPipeline()
+logger.info("Models ready. Starting UI...")
 
 
 def _get_pipeline() -> VerificationPipeline:
-    global _pipeline
-    if _pipeline is None:
-        logger.info("Ładowanie modeli insightface — proszę czekać...")
-        _pipeline = VerificationPipeline()
-        logger.info("Modele insightface gotowe.")
     return _pipeline
 
 
-# Lazy-loaded modele badawcze — ładowane przy pierwszym wyborze w UI
+# Lazy-loaded research models (first use in the UI)
 _vit_embedder: FaceEmbedder | None = None
 _swinface_embedder: SwinFaceEmbedder | None = None
 _xai: FaceXAI | None = None
@@ -62,7 +54,7 @@ _xai: FaceXAI | None = None
 def _get_vit_embedder() -> FaceEmbedder:
     global _vit_embedder
     if _vit_embedder is None:
-        logger.info("Ładowanie FaceEmbedder[vit]...")
+        logger.info("Loading FaceEmbedder[vit]...")
         _vit_embedder = FaceEmbedder(model_type="vit")
     return _vit_embedder
 
@@ -70,7 +62,7 @@ def _get_vit_embedder() -> FaceEmbedder:
 def _get_swinface_embedder() -> SwinFaceEmbedder:
     global _swinface_embedder
     if _swinface_embedder is None:
-        logger.info("Ładowanie SwinFaceEmbedder...")
+        logger.info("Loading SwinFaceEmbedder...")
         _swinface_embedder = SwinFaceEmbedder()
     return _swinface_embedder
 
@@ -80,7 +72,7 @@ _xai_swinface: FaceXAI | None = None
 
 
 def _get_xai(model_type: str) -> FaceXAI:
-    """Zwraca FaceXAI dla danego modelu (lazy-init, osobne instancje)."""
+    """Return FaceXAI for the given model type (lazy init, separate instances)."""
     global _xai_vit, _xai_swinface
     if model_type == "vit":
         if _xai_vit is None:
@@ -92,9 +84,9 @@ def _get_xai(model_type: str) -> FaceXAI:
         return _xai_swinface
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  ANALIZA BADAWCZA
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+#  Research comparison (two images)
+# =============================================================================
 
 
 def analyze_two_images(
@@ -103,23 +95,21 @@ def analyze_two_images(
     model_choice: str = "ArcFace (Baseline)",
 ) -> tuple[str, np.ndarray, np.ndarray]:
     """
-    Porównuje dwa zdjęcia: ekstrahuje embeddingi, liczy dystans kosinusowy.
-    Zwraca: (tekst wyników, obraz porównania side-by-side, mapa XAI side-by-side)
+    Compare two images: extract embeddings and cosine distance.
+
+    Returns (result markdown, side-by-side comparison image, side-by-side XAI map).
     """
     blank_small = _blank_frame(400, 200)
 
     if img_a is None or img_b is None:
-        return "Wgraj oba zdjęcia.", blank_small, blank_small
+        return "Upload both images.", blank_small, blank_small
 
-    use_arcface = model_choice.startswith("ArcFace")
     use_vit = model_choice.startswith("Vision Transformer")
     use_swinface = model_choice.startswith("SwinFace")
-
-    # Pokaż info o ładowaniu modelu (SwinFace/ViT mogą się długo ładować)
     if use_swinface:
-        gr.Info("Ładowanie modelu SwinFace (pierwsze uruchomienie może potrwać 10-15s)...")
+        gr.Info("Loading SwinFace model (first run may take 10-15s)...")
     elif use_vit:
-        gr.Info("Ładowanie modelu ViT...")
+        gr.Info("Loading ViT model...")
 
     detector = _get_pipeline()._detector
 
@@ -130,11 +120,15 @@ def analyze_two_images(
     face_b = detector.get_largest_face(bgr_b)
 
     if face_a is None:
-        return "✗ Nie wykryto twarzy na Zdjęciu A.", blank_small, blank_small
+        return "No face detected in Image A.", blank_small, blank_small
     if face_b is None:
-        return "✗ Nie wykryto twarzy na Zdjęciu B.", blank_small, blank_small
+        return "No face detected in Image B.", blank_small, blank_small
 
-    # Wybór backendu ────────────────────────────────────────────────────────────
+    # Backend selection
+    use_arcface = model_choice.startswith("ArcFace")
+    use_vit = model_choice.startswith("Vision Transformer")
+    use_swinface = model_choice.startswith("SwinFace")
+
     try:
         if use_arcface:
             embedder = _get_pipeline()._embedder
@@ -142,7 +136,7 @@ def analyze_two_images(
             emb_b = embedder.embed(face_b.aligned_crop)
             result = embedder.verify(emb_a, emb_b)
             model_label = "ArcFace buffalo_l (512-D)"
-            threshold_note = f"próg EER: `{VERIFICATION_THRESHOLD}`"
+            threshold_note = f"EER threshold: `{VERIFICATION_THRESHOLD}`"
             multitask_text = ""
 
         elif use_vit:
@@ -151,7 +145,7 @@ def analyze_two_images(
             emb_b = embedder.embed(face_b.aligned_crop)
             result = embedder.verify(emb_a, emb_b)
             model_label = "ViT-B/16 (768-D)"
-            threshold_note = "brak progu EER dla ViT — wynik orientacyjny"
+            threshold_note = "no EER threshold for ViT — indicative result"
             multitask_text = ""
 
         else:  # SwinFace
@@ -160,24 +154,27 @@ def analyze_two_images(
             analysis_b = sf.analyze(face_b.aligned_crop)
             result = sf.verify(analysis_a.embedding, analysis_b.embedding)
             model_label = "SwinFace Swin-T (512-D)"
-            threshold_note = f"próg EER ArcFace: `{VERIFICATION_THRESHOLD}` (orientacyjny dla SwinFace)"
+            threshold_note = (
+                f"ArcFace EER threshold: `{VERIFICATION_THRESHOLD}` (indicative for SwinFace)"
+            )
             multitask_text = _format_swinface_multitask(analysis_a, analysis_b)
 
     except Exception as exc:
-        logger.error("Błąd analyze_two_images: %s", exc, exc_info=True)
-        return f"✗ Błąd: {exc}", blank_small, blank_small
+        logger.error("analyze_two_images error: %s", exc, exc_info=True)
+        return f"Error: {exc}", blank_small, blank_small
 
-    verdict = "MATCH ✓" if result.is_match else "NO MATCH ✗"
+    verdict = "MATCH" if result.is_match else "NO MATCH"
     confidence = max(0.0, 1.0 - result.cosine_distance / 0.5)
 
     text = (
-        f"**Wynik:** {verdict}\n\n"
+        f"**Result:** {verdict}\n\n"
         f"**Model:** `{model_label}`\n\n"
-        f"**Dystans kosinusowy:** `{result.cosine_distance:.4f}`  "
+        f"**Cosine distance:** `{result.cosine_distance:.4f}`  "
         f"({threshold_note})\n\n"
-        f"**Orientacyjna zgodność:** `{confidence * 100:.1f}%`\n\n"
+        f"**Confidence estimate:** `{confidence * 100:.1f}%`\n\n"
         f"**Det. score A:** `{face_a.det_score:.3f}` | "
-        f"**Det. score B:** `{face_b.det_score:.3f}`" + (f"\n\n---\n{multitask_text}" if multitask_text else "")
+        f"**Det. score B:** `{face_b.det_score:.3f}`"
+        + (f"\n\n---\n{multitask_text}" if multitask_text else "")
     )
 
     comparison = _make_comparison_image(
@@ -199,9 +196,9 @@ def analyze_two_images(
     return text, comparison_rgb, xai_img
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  HELPERS WIZUALIZACJI
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+#  Visualization helpers
+# =============================================================================
 
 
 def _make_comparison_image(
@@ -210,7 +207,7 @@ def _make_comparison_image(
     distance: float,
     is_match: bool,
 ) -> np.ndarray:
-    """Tworzy obraz porównania 2×112px z etykietami i paskiem dystansu."""
+    """Build a 2x112px comparison image with labels and distance bar."""
     size = 112
     pad = 16
     bar_h = 36
@@ -230,11 +227,28 @@ def _make_comparison_image(
     canvas[y0 : y0 + size, x_a : x_a + size] = a
     canvas[y0 : y0 + size, x_b : x_b + size] = b
 
-    # Etykiety pod cropami
-    cv2.putText(canvas, "Zdj. A", (x_a + 28, y0 + size + 14), _OVERLAY_FONT, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
-    cv2.putText(canvas, "Zdj. B", (x_b + 28, y0 + size + 14), _OVERLAY_FONT, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
+    cv2.putText(
+        canvas,
+        "Image A",
+        (x_a + 24, y0 + size + 14),
+        _OVERLAY_FONT,
+        0.5,
+        (200, 200, 200),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        canvas,
+        "Image B",
+        (x_b + 24, y0 + size + 14),
+        _OVERLAY_FONT,
+        0.5,
+        (200, 200, 200),
+        1,
+        cv2.LINE_AA,
+    )
 
-    # Pasek dystansu (0.0 → zielony, 0.5+ → czerwony)
+    # Distance bar: green toward 0.0, red toward 0.5+
     color = _COLOR_OK if is_match else _COLOR_FAIL
     bar_y = y0 + size + 20
     bar_fill = int(np.clip(distance / 0.5, 0.0, 1.0) * (total_w - pad * 2))
@@ -245,9 +259,18 @@ def _make_comparison_image(
     threshold_x = int((VERIFICATION_THRESHOLD / 0.5) * (total_w - pad * 2)) + pad
     cv2.line(canvas, (threshold_x, bar_y - 2), (threshold_x, bar_y + 12), (0, 165, 255), 2)
 
-    # Wynik
+    # Verdict label
     verdict = "MATCH" if is_match else "NO MATCH"
-    cv2.putText(canvas, f"{verdict}  d={distance:.4f}", (pad, bar_y + 28), _OVERLAY_FONT, 0.5, color, 1, cv2.LINE_AA)
+    cv2.putText(
+        canvas,
+        f"{verdict}  d={distance:.4f}",
+        (pad, bar_y + 28),
+        _OVERLAY_FONT,
+        0.5,
+        color,
+        1,
+        cv2.LINE_AA,
+    )
 
     return canvas
 
@@ -256,24 +279,32 @@ def _format_swinface_multitask(
     a: SwinFaceAnalysis,
     b: SwinFaceAnalysis,
 ) -> str:
-    """Formatuje wyniki multitask SwinFace jako Markdown (dwie kolumny: A i B)."""
+    """Format SwinFace multitask results as a Markdown table."""
 
     def _yn(v: bool) -> str:
-        return "tak" if v else "nie"
+        return "Yes" if v else "No"
 
     rows = [
-        ("Wiek (regresja)", f"`{a.age:.1f}`", f"`{b.age:.1f}`"),
-        ("Płeć", f"{a.gender} ({a.gender_conf * 100:.0f}%)", f"{b.gender} ({b.gender_conf * 100:.0f}%)"),
+        ("Age (regression)", f"`{a.age:.1f}`", f"`{b.age:.1f}`"),
         (
-            "Ekspresja",
+            "Gender",
+            f"{a.gender} ({a.gender_conf * 100:.0f}%)",
+            f"{b.gender} ({b.gender_conf * 100:.0f}%)",
+        ),
+        (
+            "Expression",
             f"{a.expression} ({a.expression_conf * 100:.0f}%)",
             f"{b.expression} ({b.expression_conf * 100:.0f}%)",
         ),
-        ("Uśmiech", _yn(a.smiling), _yn(b.smiling)),
-        ("Okulary", _yn(a.eyeglasses), _yn(b.eyeglasses)),
+        ("Smiling", _yn(a.smiling), _yn(b.smiling)),
+        ("Eyeglasses", _yn(a.eyeglasses), _yn(b.eyeglasses)),
     ]
 
-    lines = ["**Analiza multitask SwinFace**\n", "| Cecha | Zdjęcie A | Zdjęcie B |", "|---|---|---|"]
+    lines = [
+        "**SwinFace Multitask Analysis**\n",
+        "| Attribute | Image A | Image B |",
+        "|---|---|---|",
+    ]
     for name, va, vb in rows:
         lines.append(f"| {name} | {va} | {vb} |")
 
@@ -287,30 +318,28 @@ def _make_xai_image(
     use_swinface: bool = False,
 ) -> np.ndarray:
     """
-    Generuje obraz XAI side-by-side (mapa cieplna A | mapa cieplna B).
+    Build side-by-side XAI visualization (heatmap A | heatmap B).
 
-    Dla ArcFace — plansza informacyjna (brak XAI).
-    crop_a / crop_b : (112, 112, 3) BGR aligned crops
-    Zwraca          : (H, W, 3) RGB uint8
+    For ArcFace, returns an informational placeholder (no XAI path).
+    ``crop_a`` / ``crop_b``: (112, 112, 3) BGR aligned crops.
+    Returns (H, W, 3) RGB uint8.
     """
-    xai_size = 224  # rozmiar każdej mapy
+    xai_size = 224  # pixels per heatmap tile
 
     if use_vit:
         xai_type = "vit"
-        xai_label = "Attention Rollout (ViT-B/16)"
     elif use_swinface:
         xai_type = "swinface"
-        xai_label = "Global Feature Map (SwinFace Stage-4)"
     else:
-        # ArcFace — brak XAI
+        # ArcFace: no attention XAI
         w = xai_size * 2 + 32
         h = xai_size
         canvas = np.zeros((h, w, 3), dtype=np.uint8)
         canvas[:] = (40, 40, 40)
         cv2.putText(
             canvas,
-            "XAI niedostepne dla ArcFace (CNN)",
-            (w // 2 - 180, h // 2 - 10),
+            "XAI not available for ArcFace (CNN)",
+            (w // 2 - 190, h // 2 - 10),
             _OVERLAY_FONT,
             0.6,
             (180, 180, 180),
@@ -319,7 +348,7 @@ def _make_xai_image(
         )
         cv2.putText(
             canvas,
-            "Wybierz ViT lub SwinFace",
+            "Select ViT or SwinFace",
             (w // 2 - 120, h // 2 + 20),
             _OVERLAY_FONT,
             0.55,
@@ -341,12 +370,15 @@ def _make_xai_image(
 
     side_by_side = np.concatenate([map_a, sep, map_b], axis=1)  # (224, 456, 3)
 
-    # Etykiety nad mapami
-    out = np.zeros((xai_size + 28, side_by_side.shape[1], 3), dtype=np.uint8)
-    out[28:, :] = side_by_side
-    out[:28, :] = (30, 30, 30)
-    cv2.putText(out, f"Zdj. A — {xai_label}", (4, 19), _OVERLAY_FONT, 0.45, (210, 210, 210), 1, cv2.LINE_AA)
-    cv2.putText(out, f"Zdj. B — {xai_label}", (xai_size + 12, 19), _OVERLAY_FONT, 0.45, (210, 210, 210), 1, cv2.LINE_AA)
+    header_h = 24
+    total_w = side_by_side.shape[1]
+    out = np.zeros((xai_size + header_h, total_w, 3), dtype=np.uint8)
+    out[header_h:, :] = side_by_side
+    out[:header_h, :] = (30, 30, 30)
+
+    col_b_x = xai_size + 8
+    cv2.putText(out, "A", (4, 17), _OVERLAY_FONT, 0.5, (210, 210, 210), 1, cv2.LINE_AA)
+    cv2.putText(out, "B", (col_b_x, 17), _OVERLAY_FONT, 0.5, (210, 210, 210), 1, cv2.LINE_AA)
 
     return out
 
@@ -354,35 +386,36 @@ def _make_xai_image(
 def _blank_frame(w: int = 640, h: int = 480) -> np.ndarray:
     img = np.zeros((h, w, 3), dtype=np.uint8)
     img[:] = (30, 30, 30)
-    cv2.putText(img, "Brak obrazu", (w // 2 - 60, h // 2), _OVERLAY_FONT, 0.7, (120, 120, 120), 1, cv2.LINE_AA)
+    cv2.putText(
+        img, "No image", (w // 2 - 50, h // 2), _OVERLAY_FONT, 0.7, (120, 120, 120), 1, cv2.LINE_AA
+    )
     return img
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  BUDOWA INTERFEJSU GRADIO
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+#  Gradio UI
+# =============================================================================
 
 
 def build_ui() -> gr.Blocks:
-    with gr.Blocks(title="Analiza Badawcza — Embeddingi") as demo:  # noqa: SIM117
+    with gr.Blocks(title="Face Verification — Embedding Comparison") as demo:
         with gr.Tabs():
-            with gr.Tab("🔬 Analiza Badawcza — Embeddingi"):
+            with gr.Tab("Face comparison"):
                 gr.Markdown(
-                    "### Porównanie dwóch zdjęć\n"
-                    "Wgraj dwa zdjęcia twarzy. Obliczymy dystans kosinusowy między nimi "
-                    f"i zestawimy go z progiem EER `{VERIFICATION_THRESHOLD}`.\n\n"
-                    f"---\n[Space na Hugging Face]({_HF_SPACE_URL})"
+                    "### Compare two face images\n"
+                    "Upload two photos — the system computes cosine distance between "
+                    f"face embeddings and compares against EER threshold `{VERIFICATION_THRESHOLD}` (ArcFace)."
                 )
 
                 with gr.Row():
                     img_input_a = gr.Image(
-                        label="Zdjęcie A",
+                        label="Image A",
                         sources=["upload", "webcam"],
                         type="numpy",
                         height=280,
                     )
                     img_input_b = gr.Image(
-                        label="Zdjęcie B",
+                        label="Image B",
                         sources=["upload", "webcam"],
                         type="numpy",
                         height=280,
@@ -391,22 +424,22 @@ def build_ui() -> gr.Blocks:
                 model_radio = gr.Radio(
                     choices=["ArcFace (Baseline)", "Vision Transformer (ViT)", "SwinFace (Swin-T)"],
                     value="ArcFace (Baseline)",
-                    label="Wybór architektury ekstrakcji cech",
+                    label="Embedding model",
                 )
 
-                compare_btn = gr.Button("Porównaj twarze", variant="primary")
+                compare_btn = gr.Button("Compare faces", variant="primary")
 
                 with gr.Row():
-                    research_text = gr.Markdown(label="Wyniki")
+                    research_text = gr.Markdown(label="Results")
                     comparison_img = gr.Image(
-                        label="Aligned crops + dystans",
+                        label="Aligned crops + distance",
                         type="numpy",
                         height=200,
                         interactive=False,
                     )
 
                 xai_img = gr.Image(
-                    label="Wyjaśnialność modelu (Attention Map / XAI)",
+                    label="Model explainability (Attention Map / XAI)",
                     type="numpy",
                     height=260,
                     interactive=False,
@@ -421,9 +454,9 @@ def build_ui() -> gr.Blocks:
     return demo
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  ENTRY POINT
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+#  Entry point
+# =============================================================================
 
 if __name__ == "__main__":
     demo = build_ui()

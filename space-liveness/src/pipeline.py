@@ -1,14 +1,15 @@
 """
-VerificationPipeline — główna fasada systemu weryfikacji twarzy.
+Main facade for face verification with Presentation Attack Detection (PAD).
 
-Kolejność kroków dla każdej klatki z kamery:
-  1. Detekcja twarzy + alignment (FaceDetector → DetectedFace)
-  2. PAD / Liveness check (PADPipeline → PADResult)
-  3. Ekstrakcja embeddingu z aligned crop (FaceEmbedder → np.ndarray)
-  4. Porównanie z wektorem referencyjnym (FaceEmbedder.verify → VerificationResult)
+Per camera frame the pipeline runs:
+  1. Face detection + alignment (FaceDetector → DetectedFace)
+  2. PAD / liveness (PADPipeline → PADResult)
+  3. Embedding from the aligned crop (FaceEmbedder → np.ndarray)
+  4. Comparison to the reference vector (FaceEmbedder.verify → VerificationResult)
 
-Weryfikacja tożsamości (krok 4) uruchamiana jest TYLKO gdy liveness_passed == True.
-Embedding referencyjny rejestrujemy raz przez register_reference() ze zdjęcia dokumentu.
+Identity verification (step 4) runs only when ``liveness_passed`` is True.
+Register the reference embedding once via ``register_reference()`` from a reference image
+(e.g. ID document photo).
 """
 
 from __future__ import annotations
@@ -19,63 +20,69 @@ from enum import Enum, auto
 
 import numpy as np
 
-from src.pad.liveness import PADPipeline, PADResult
+from src.pad.liveness import (
+    LBP_VAR_THRESHOLD,
+    MOIRE_FFT_THRESHOLD,
+    SPECULAR_RATIO_MAX,
+    PADPipeline,
+    PADResult,
+)
 from src.vision.detector import DetectedFace, FaceDetector
 from src.vision.embedder import VERIFICATION_THRESHOLD, FaceEmbedder, VerificationResult
 
 logger = logging.getLogger(__name__)
 
 
-# ─── Stany sesji ─────────────────────────────────────────────────────────────
+# ─── Session states ──────────────────────────────────────────────────────────
 
 
 class SessionState(Enum):
-    """Etapy życia jednej sesji weryfikacji."""
+    """Lifecycle states for one verification session."""
 
-    WAITING_FOR_REFERENCE = auto()  # brak wektora referencyjnego
-    WAITING_FOR_BLINK = auto()  # referencja zarejestrowana, czeka na mrugnięcie
-    VERIFIED = auto()  # liveness OK + MATCH
-    REJECTED_LIVENESS = auto()  # liveness nie przeszedł
-    REJECTED_IDENTITY = auto()  # liveness OK, ale NO MATCH
+    WAITING_FOR_REFERENCE = auto()  # no reference embedding yet
+    WAITING_FOR_BLINK = auto()  # reference registered; waiting for blink
+    VERIFIED = auto()  # liveness OK + identity MATCH
+    REJECTED_LIVENESS = auto()  # PAD / liveness failed
+    REJECTED_IDENTITY = auto()  # liveness OK but NO MATCH
 
 
-# ─── Wynik przetworzenia klatki ───────────────────────────────────────────────
+# ─── Single-frame aggregate result ───────────────────────────────────────────
 
 
 @dataclass
 class FrameResult:
-    """Zagregowany wynik dla jednej klatki z kamery."""
+    """Aggregated output for one camera frame."""
 
     state: SessionState
 
-    # Czy twarz w ogóle wykryta na klatce
+    # Whether any face was detected in the frame
     face_detected: bool = False
 
-    # Wynik PAD (None gdy brak twarzy)
+    # PAD outcome (None if no face)
     pad: PADResult | None = None
 
-    # Wynik weryfikacji (None gdy liveness nie przeszedł lub brak referencji)
+    # Verification outcome (None if liveness failed or no reference)
     verification: VerificationResult | None = None
 
-    # Aktualny EAR — do wyświetlenia w UI nawet gdy brak wyniku weryfikacji
+    # Current EAR (for UI/debug even when verification did not run)
     ear: float = 0.0
 
-    # Czytelny komunikat dla Gradio UI
+    # Human-readable message for the UI
     message: str = ""
 
 
-# ─── Główna klasa ─────────────────────────────────────────────────────────────
+# ─── Main orchestrator ─────────────────────────────────────────────────────────
 
 
 class VerificationPipeline:
     """
-    Bezstanowy względem modeli (modele ładowane raz w __init__),
-    stanowy względem sesji (reset_session() czyści stan między użytkownikami).
+    Models are loaded once in ``__init__`` (stateless w.r.t. weights).
+    Session state is reset with ``reset_session()`` between users.
 
-    Typowy flow:
+    Typical flow::
+
         pipeline = VerificationPipeline()
         pipeline.register_reference(reference_image_bgr)
-
         pipeline.reset_session()
         for frame in camera_stream:
             result = pipeline.process_frame(frame)
@@ -90,62 +97,60 @@ class VerificationPipeline:
     ) -> None:
         _providers = providers or ["CPUExecutionProvider"]
 
-        logger.info("Inicjalizacja VerificationPipeline...")
+        logger.info("Initializing VerificationPipeline...")
         self._detector = FaceDetector(providers=_providers)
 
-        # Embedder współdzieli FaceAnalysis z detektorem — jeden zestaw modeli
-        self._embedder = FaceEmbedder(_app=self._detector._app)
+        # Embedder shares FaceAnalysis with the detector (single model bundle)
+        self._embedder = FaceEmbedder(shared_face_analysis=self._detector.face_analysis)
 
         self._pad = PADPipeline()
         self._threshold = verification_threshold
 
-        # Stan sesji
         self._reference_embedding: np.ndarray | None = None
         self._session_state: SessionState = SessionState.WAITING_FOR_REFERENCE
 
-        logger.info("VerificationPipeline gotowy.")
+        logger.info("VerificationPipeline ready.")
 
-    # ── Rejestracja referencji ─────────────────────────────────────────────
+    # ── Reference registration ────────────────────────────────────────────────
 
     def register_reference(self, reference_image: np.ndarray) -> bool:
         """
-        Ekstrahuje i zapisuje embedding ze zdjęcia referencyjnego (np. dokumentu).
+        Extract and store the embedding from a reference image (e.g. document).
 
-        reference_image: BGR image (dowolny rozmiar — detekcja wykona alignment)
-        Zwraca True gdy referencja zarejestrowana pomyślnie, False gdy brak twarzy.
+        ``reference_image``: BGR ``uint8`` array at any resolution; detection performs alignment.
+        Returns True if registration succeeded, False if no face was found.
         """
         face = self._detector.get_largest_face(reference_image)
         if face is None:
-            logger.warning("register_reference: nie wykryto twarzy na zdjęciu referencyjnym.")
+            logger.warning("register_reference: no face detected in reference image.")
             return False
 
         try:
             self._reference_embedding = self._embedder.embed(face.aligned_crop)
         except ValueError as exc:
-            logger.error("register_reference: błąd embeddingu — %s", exc)
+            logger.error("register_reference: embedding error — %s", exc)
             return False
 
-        logger.info("Referencja zarejestrowana (det_score=%.3f).", face.det_score)
+        logger.info("Reference registered (det_score=%.3f).", face.det_score)
 
         if self._session_state == SessionState.WAITING_FOR_REFERENCE:
             self._session_state = SessionState.WAITING_FOR_BLINK
 
         return True
 
-    # ── Zarządzanie sesją ──────────────────────────────────────────────────
+    # ── Session control ───────────────────────────────────────────────────────
 
     def reset_session(self) -> None:
         """
-        Resetuje stan sesji PAD (licznik mrugnięć, stan automatu).
-        NIE kasuje wektora referencyjnego — ten pozostaje do następnego
-        wywołania register_reference().
+        Reset PAD session state (blink counters, internal FSM).
+        Does **not** clear the reference embedding until the next ``register_reference()``.
         """
         self._pad.reset()
         if self._reference_embedding is not None:
             self._session_state = SessionState.WAITING_FOR_BLINK
         else:
             self._session_state = SessionState.WAITING_FOR_REFERENCE
-        logger.debug("Sesja zresetowana.")
+        logger.debug("Session reset.")
 
     @property
     def state(self) -> SessionState:
@@ -155,19 +160,16 @@ class VerificationPipeline:
     def has_reference(self) -> bool:
         return self._reference_embedding is not None
 
-    # ── Przetwarzanie klatki ───────────────────────────────────────────────
+    # ── Frame processing ──────────────────────────────────────────────────────
 
     def process_frame(self, frame: np.ndarray) -> FrameResult:
         """
-        Przetwarza jedną klatkę z kamery.
+        Process one BGR camera frame.
 
-        frame: BGR image z kamery internetowej
-        Zwraca FrameResult z aktualnym stanem sesji i metrykami diagnostycznymi.
-
-        Gdy sesja już zakończona (VERIFIED / REJECTED_*), kolejne klatki są
-        ignorowane i zwracany jest wynik końcowy bez ponownych obliczeń.
+        Returns a :class:`FrameResult` with the current session state and diagnostics.
+        If the session already ended (VERIFIED / REJECTED_*), later frames are not
+        reprocessed; the terminal result is returned as-is.
         """
-        # Sesja już zakończona — nie przetwarzaj dalej
         if self._session_state in (
             SessionState.VERIFIED,
             SessionState.REJECTED_LIVENESS,
@@ -178,56 +180,50 @@ class VerificationPipeline:
                 message=_state_message(self._session_state),
             )
 
-        # Brak referencji
         if self._reference_embedding is None:
             return FrameResult(
                 state=SessionState.WAITING_FOR_REFERENCE,
-                message="Najpierw zarejestruj zdjęcie referencyjne.",
+                message="Register a reference image first.",
             )
 
-        # ── Krok 1: detekcja ──────────────────────────────────────────────
         face: DetectedFace | None = self._detector.get_largest_face(frame)
 
         if face is None:
             return FrameResult(
                 state=self._session_state,
                 face_detected=False,
-                message="Nie wykryto twarzy — ustaw twarz w kadrze.",
+                message="No face detected — center your face in the frame.",
             )
 
-        # ── Krok 2: PAD / liveness ────────────────────────────────────────
         pad_result: PADResult = self._pad.process_frame(
-            landmarks=face.landmarks_68,  # iBUG 68-pkt — pewne indeksy oczu
+            landmarks=face.landmarks_68,
             face_crop=face.aligned_crop,
         )
 
-        # Liveness nie przeszedł — sprawdź czy to timeout (atak foto) czy tylko czekamy
         if not pad_result.liveness_passed:
             if pad_result.blink_timed_out:
                 self._session_state = SessionState.REJECTED_LIVENESS
-                logger.warning("Sesja odrzucona: timeout mrugnięcia — atak fotograficzny.")
+                logger.warning("Session rejected: blink timeout (likely photo / replay attack).")
             return FrameResult(
                 state=self._session_state,
                 face_detected=True,
                 pad=pad_result,
                 ear=pad_result.ear_current,
-                message=pad_result.reason or "Proszę mrugnąć do kamery.",
+                message=pad_result.reason or "Please blink at the camera.",
             )
 
-        # ── Krok 3: embedding probe ───────────────────────────────────────
         try:
             probe_embedding = self._embedder.embed(face.aligned_crop)
         except ValueError as exc:
-            logger.error("process_frame: błąd embeddingu probe — %s", exc)
+            logger.error("process_frame: probe embedding error — %s", exc)
             return FrameResult(
                 state=self._session_state,
                 face_detected=True,
                 pad=pad_result,
                 ear=pad_result.ear_current,
-                message="Błąd ekstrakcji cech twarzy — spróbuj ponownie.",
+                message="Face embedding failed — please try again.",
             )
 
-        # ── Krok 4: weryfikacja tożsamości ────────────────────────────────
         verification: VerificationResult = self._embedder.verify(
             embedding_probe=probe_embedding,
             embedding_reference=self._reference_embedding,
@@ -237,14 +233,14 @@ class VerificationPipeline:
         if verification.is_match:
             self._session_state = SessionState.VERIFIED
             logger.info(
-                "Weryfikacja POZYTYWNA (d=%.4f ≤ %.4f).",
+                "Verification MATCH (d=%.4f ≤ %.4f).",
                 verification.cosine_distance,
                 self._threshold,
             )
         else:
             self._session_state = SessionState.REJECTED_IDENTITY
             logger.info(
-                "Weryfikacja NEGATYWNA (d=%.4f > %.4f).",
+                "Verification NO MATCH (d=%.4f > %.4f).",
                 verification.cosine_distance,
                 self._threshold,
             )
@@ -264,11 +260,9 @@ class VerificationPipeline:
 
 def _is_screen_attack(pad: PADResult) -> bool:
     """
-    Zwraca True gdy PAD wykrył atak ekranowy BEZ czekania na mrugnięcie.
-    Używane do szybkiego odrzucenia przed zakończeniem fazy liveness.
+    True if PAD indicates a screen-like presentation attack (texture / moiré cues)
+    before blink-based liveness completes. Can be used for fast rejection.
     """
-    from src.pad.liveness import LBP_VAR_THRESHOLD, MOIRE_FFT_THRESHOLD, SPECULAR_RATIO_MAX
-
     return (
         pad.moire_score > MOIRE_FFT_THRESHOLD
         or pad.lbp_variance > LBP_VAR_THRESHOLD
@@ -278,15 +272,17 @@ def _is_screen_attack(pad: PADResult) -> bool:
 
 def _state_message(state: SessionState) -> str:
     return {
-        SessionState.VERIFIED: "✓ Weryfikacja zakończona pomyślnie.",
-        SessionState.REJECTED_LIVENESS: "✗ Odrzucono: wykryto atak prezentacyjny.",
-        SessionState.REJECTED_IDENTITY: "✗ Odrzucono: tożsamość nie potwierdzona.",
-        SessionState.WAITING_FOR_BLINK: "Proszę mrugnąć do kamery.",
-        SessionState.WAITING_FOR_REFERENCE: "Brak zdjęcia referencyjnego.",
+        SessionState.VERIFIED: "Verification completed successfully.",
+        SessionState.REJECTED_LIVENESS: "Rejected: presentation attack detected.",
+        SessionState.REJECTED_IDENTITY: "Rejected: identity not confirmed.",
+        SessionState.WAITING_FOR_BLINK: "Please blink at the camera.",
+        SessionState.WAITING_FOR_REFERENCE: "No reference image registered.",
     }.get(state, "")
 
 
 def _verification_message(result: VerificationResult) -> str:
     if result.is_match:
-        return f"✓ MATCH — dystans kosinusowy: {result.cosine_distance:.4f}"
-    return f"✗ NO MATCH — dystans kosinusowy: {result.cosine_distance:.4f} (próg: {result.threshold})"
+        return f"MATCH — cosine distance: {result.cosine_distance:.4f}"
+    return (
+        f"NO MATCH — cosine distance: {result.cosine_distance:.4f} (threshold: {result.threshold})"
+    )

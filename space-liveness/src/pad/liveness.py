@@ -1,13 +1,14 @@
 """
-Presentation Attack Detection (PAD) module.
+Presentation Attack Detection (PAD) for live face capture.
 
-Dwie niezależne warstwy ochrony:
-  1. BlinkDetector  — EAR (Eye Aspect Ratio) z 106-punktowych landmarków insightface.
-                      Wykrywa mrugnięcie → obrona przed zdjęciami/wydrukami.
-  2. MoireDetector  — FFT (Moiré) + LBP + Specular highlights z OpenCV.
-                      Wykrywa ekrany telefonów/tabletów.
+Two complementary cues:
 
-Fasada: PADPipeline.process_frame(landmarks, face_crop) → PADResult
+1. **BlinkDetector** — Eye Aspect Ratio (EAR) on 68-point iBUG landmarks (from InsightFace).
+   Detects a blink sequence → mitigates static photo / print replay.
+2. **MoireDetector** — FFT moiré energy, OpenCV LBP variance, and HSV specular ratio.
+   Flags phone / monitor presentation.
+
+Facade: ``PADPipeline.process_frame(landmarks, face_crop)`` → :class:`PADResult`.
 """
 
 from __future__ import annotations
@@ -20,62 +21,62 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# ─── Indeksy landmarków (insightface 1k3d68 — standard iBUG 68-punktowy) ────
-# Używamy landmark_3d_68 zamiast 2d106det — indeksy są oficjalnie udokumentowane.
-# Prawe oko (z perspektywy obserwatora): 36–41
-# Lewe  oko (z perspektywy obserwatora): 42–47
-# Kolejność w każdej grupie: kąt_lewy, górna_zewn, górna_wewn,
-#                             kąt_prawy, dolna_wewn, dolna_zewn
+# --- Landmark indices (InsightFace 1k3d68 → iBUG 68) ---
+# We use landmark_3d_68 (not 2d106det) for documented index semantics.
+# Right eye (observer view): 36–41
+# Left eye  (observer view): 42–47
+# Order per eye: outer corner, upper outer, upper inner,
+#                inner corner, lower inner, lower outer
 _RIGHT_EYE_IDX: tuple[int, ...] = (36, 37, 38, 39, 40, 41)
 _LEFT_EYE_IDX: tuple[int, ...] = (42, 43, 44, 45, 46, 47)
 
-# ─── Progi operacyjne ────────────────────────────────────────────────────────
-EAR_BLINK_THRESHOLD: float = 0.20  # poniżej → oko zamknięte  (SKILLS.md §2)
-EAR_CONSEC_FRAMES: int = 2  # min. klatek z zamkniętym okiem = 1 mrugnięcie
+# --- Operational thresholds ---
+EAR_BLINK_THRESHOLD: float = 0.20  # below → eye considered closed
+EAR_CONSEC_FRAMES: int = 2  # min consecutive closed-eye frames = one blink
 
-# FFT: znormalizowana energia poza centrum widma (0.0 = naturalne, 1.0 = ekran)
-# Normalna kamera internetowa: ~0.60–0.68
-# Twarz na ekranie telefonu/monitora: ~0.75–0.92 (siatka subpikseli + JPEG re-kompresja)
+# FFT: normalized energy outside spectrum center (0.0 natural, 1.0 screen-like)
+# Typical webcam: ~0.60–0.68; face on phone/monitor: ~0.75–0.92
 MOIRE_FFT_THRESHOLD: float = 0.72
 
-# Timeout blink: jeśli twarz widoczna przez N klatek bez mrugnięcia → atak fotograficzny
-# Przy ~12fps: 90 klatek ≈ 7.5 sekundy. Żywa osoba ZAWSZE mrugnęła w ciągu 10s.
+# Blink timeout: face visible N frames with no blink → static replay attack
+# At ~12 fps, 90 frames ~ 7.5 s.
 BLINK_TIMEOUT_FRAMES: int = 90
-# Promień wewnętrzny filtra dolnoprzepustowego (% min. wymiaru obrazu)
+# Inner radius of FFT low-pass mask (% of min image dimension)
 _FFT_LOWPASS_RATIO: float = 0.10
 
-# LBP: wariancja histogramu (×10⁶) — skóra niska, pikselowa siatka ekranu wysoka
-# Kamery internetowe kompresują obraz co podnosi LBP baseline do ~150–200
+# LBP: histogram variance (×10^6) — skin low, pixel-grid screens high
+# Webcam compression often raises baseline ~150–200
 LBP_VAR_THRESHOLD: float = 350.0
 
-# Specular: max. udział prześwietlonych pikseli (V > 240 w HSV) na obszarze twarzy
+# Specular: max share of saturated pixels (V > 240 in HSV) on face crop
 SPECULAR_RATIO_MAX: float = 0.20
 
 
-# ─── Struktury danych ────────────────────────────────────────────────────────
+# --- Data structures ---
 
 
 @dataclass
 class PADResult:
+    """Aggregated PAD outcome for one frame (blink state + texture cues)."""
+
     liveness_passed: bool
     blink_detected: bool
-    blink_timed_out: bool  # True gdy twarz widoczna >BLINK_TIMEOUT_FRAMES bez mrugnięcia
-    ear_current: float  # aktualny EAR na tej klatce
-    moire_score: float  # [0, 1] — wyższy → bardziej podejrzane
+    blink_timed_out: bool  # True if face visible >BLINK_TIMEOUT_FRAMES without blink
+    ear_current: float  # mean EAR this frame
+    moire_score: float  # higher → more screen-like (FFT cue)
     lbp_variance: float
     specular_ratio: float
-    reason: str = ""  # czytelny powód odrzucenia (pusty gdy OK)
+    reason: str = ""  # human-readable rejection reason (empty if OK)
 
 
-# ─── Moduł 1: BlinkDetector ──────────────────────────────────────────────────
+# --- Module 1: BlinkDetector ---
 
 
 class BlinkDetector:
     """
-    Śledzi stan powiek na kolejnych klatkach i rejestruje mrugnięcie.
+    Frame-to-frame eyelid state; registers one blink per verification session.
 
-    Stan jest kumulatywny w obrębie sesji weryfikacji — wywołaj reset()
-    na początku każdej nowej sesji.
+    State is cumulative until :meth:`reset` (call at the start of each session).
     """
 
     def __init__(
@@ -88,10 +89,10 @@ class BlinkDetector:
         self._consec = consec_frames
         self._timeout = timeout_frames
         self._counter: int = 0
-        self._total_frames: int = 0  # klatki z wykrytą twarzą
+        self._total_frames: int = 0  # frames with face present
         self._blink_detected: bool = False
 
-    # ── API publiczne ──────────────────────────────────────────────────────
+    # --- Public API ---
 
     def reset(self) -> None:
         self._counter = 0
@@ -104,15 +105,15 @@ class BlinkDetector:
 
     @property
     def timed_out(self) -> bool:
-        """True gdy twarz widoczna przez >timeout_frames bez ani jednego mrugnięcia."""
+        """True if a face was visible for >``timeout_frames`` without any blink."""
         return (not self._blink_detected) and (self._total_frames >= self._timeout)
 
     def update(self, landmarks: np.ndarray) -> float:
         """
-        Aktualizuje stan automatu na podstawie landmarków jednej klatki.
+        Update the blink FSM from one frame's 68-point landmarks.
 
-        landmarks: (68, 3) float — face.landmark_3d_68 z insightface
-        Zwraca: aktualny avg_EAR (przydatny do debugowania w UI)
+        ``landmarks``: (68, 3) float32 from InsightFace ``landmark_3d_68``.
+        Returns the current average EAR (for UI / debugging).
         """
         self._total_frames += 1
         ear = self._avg_ear(landmarks)
@@ -123,7 +124,7 @@ class BlinkDetector:
             if self._counter >= self._consec:
                 self._blink_detected = True
                 logger.debug(
-                    "Mrugnięcie wykryte (EAR=%.3f, klatki=%d)",
+                    "Blink detected (EAR=%.3f, frames=%d)",
                     ear,
                     self._counter,
                 )
@@ -131,7 +132,7 @@ class BlinkDetector:
 
         return ear
 
-    # ── Obliczenia EAR ────────────────────────────────────────────────────
+    # --- EAR computation ---
 
     def _avg_ear(self, lm: np.ndarray) -> float:
         ear_l = _eye_aspect_ratio(lm, _LEFT_EYE_IDX)
@@ -139,14 +140,14 @@ class BlinkDetector:
         return (ear_l + ear_r) / 2.0
 
 
-# ─── Moduł 2: MoireDetector ──────────────────────────────────────────────────
+# --- Module 2: MoireDetector ---
 
 
 class MoireDetector:
     """
-    Trójwarstwowa analiza obrazu twarzy (wyłącznie OpenCV + NumPy).
+    Texture-based PAD cues using OpenCV + NumPy only.
 
-    Bezstanowy — każde wywołanie analyze() jest niezależne.
+    Stateless: each :meth:`analyze` call is independent.
     """
 
     def analyze(
@@ -154,11 +155,12 @@ class MoireDetector:
         face_crop: np.ndarray,
     ) -> tuple[float, float, float]:
         """
-        face_crop: BGR obraz wyciętej twarzy (np. 112×112 z aligned_crop).
-        Zwraca: (moire_score, lbp_variance, specular_ratio)
+        ``face_crop``: BGR face patch (e.g. 112×112 ``aligned_crop``).
+
+        Returns ``(moire_score, lbp_variance, specular_ratio)``.
         """
         if face_crop is None or face_crop.size == 0:
-            logger.warning("MoireDetector.analyze: pusty face_crop.")
+            logger.warning("MoireDetector.analyze: empty face_crop.")
             return 0.0, 0.0, 0.0
 
         gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
@@ -175,24 +177,24 @@ class MoireDetector:
         )
         return moire, lbp_var, specular
 
-    # ── A. FFT Moiré ──────────────────────────────────────────────────────
+    # --- A. FFT moiré ---
 
     @staticmethod
     def _fft_moire_score(gray: np.ndarray) -> float:
         """
-        Energia w wysokich częstotliwościach / energia całkowita.
+        High-frequency energy / total energy in the amplitude spectrum.
 
-        Ekrany cyfrowe mają regularną siatkę pikseli, która przy nagraniu
-        kamerą tworzy efekt Moiré — nienaturalne piki poza centrum widma FFT.
+        Digital displays add a regular pixel grid; when re-captured on camera this
+        yields moiré — abnormal peaks away from the FFT center.
 
-        Algorytm:
-          1. DFT → przesunięcie centrum → moduł widma amplitudowego
-          2. Maska kołowa: odrzuca centrum (niskie częstotliwości, DC)
-          3. Stosunek energii poza centrum do energii całkowitej
+        Steps:
+          1. DFT → fftshift → magnitude spectrum
+          2. Circular mask removes the DC / low-frequency disk
+          3. Ratio of energy outside the disk to total energy
         """
         f32 = gray.astype(np.float32)
 
-        # DFT przez OpenCV (szybsze niż np.fft dla małych obrazów)
+        # OpenCV DFT is fast for small crops
         dft = cv2.dft(f32, flags=cv2.DFT_COMPLEX_OUTPUT)
         dft_shift = np.fft.fftshift(dft)  # DC → centrum
         mag = cv2.magnitude(dft_shift[:, :, 0], dft_shift[:, :, 1])
@@ -201,7 +203,7 @@ class MoireDetector:
         cy, cx = h // 2, w // 2
         r_inner = int(min(h, w) * _FFT_LOWPASS_RATIO)
 
-        # Maska kołowa: True poza promieniem r_inner (wysokie częstotliwości)
+        # Ring mask: True outside r_inner (high frequencies)
         y_idx, x_idx = np.ogrid[:h, :w]
         dist_sq = (y_idx - cy) ** 2 + (x_idx - cx) ** 2
         high_freq_mask = dist_sq > r_inner**2
@@ -211,22 +213,19 @@ class MoireDetector:
 
         return high_energy / total_energy
 
-    # ── B. LBP (Local Binary Patterns) ───────────────────────────────────
+    # --- B. LBP (local binary patterns) ---
 
     @staticmethod
     def _lbp_variance(gray: np.ndarray) -> float:
         """
-        Wariancja histogramu LBP — implementacja przez morfologię OpenCV.
+        Variance of the LBP histogram (OpenCV-only 8-neighbor LBP).
 
-        Skóra → płynna tekstura → niski, szeroki histogram.
-        Siatka pikseli ekranu → powtarzalny wzór → wysoka wariancja histogramu.
+        Skin tends to a smooth texture → low, broad histogram.
+        Screen pixel grids → repetitive pattern → high histogram variance.
 
-        Uproszczony LBP 3×3 bez scikit-image:
-          - Dla każdego piksela porównujemy 8 sąsiadów z centrum
-          - Budujemy wartość 8-bitową (0–255)
-          - Histogram tej wartości jest sygnaturą tekstury
+        Per pixel: compare 8 neighbors to center, pack into one byte, histogram.
         """
-        # Przesunięcia 8 sąsiadów wokół centrum piksela
+        # 8 neighbor offsets
         _neighbors = [
             (-1, -1),
             (-1, 0),
@@ -248,18 +247,15 @@ class MoireDetector:
 
         hist = cv2.calcHist([lbp], [0], None, [256], [0, 256]).flatten()
         hist_norm = hist / (hist.sum() + 1e-9)
-        # Skalujemy ×10⁶ aby uzyskać czytelny zakres liczbowy
+        # Scale ×1e6 for a readable numeric range
         return float(np.var(hist_norm) * 1e6)
 
-    # ── C. Specular Highlights ────────────────────────────────────────────
+    # --- C. Specular highlights ---
 
     @staticmethod
     def _specular_ratio(bgr: np.ndarray) -> float:
         """
-        Udział prześwietlonych pikseli (V > 240) w obszarze twarzy.
-
-        Ekrany szklane odbijają światło nienaturalnie intensywnie.
-        Kanał V (Value) w przestrzeni HSV wykrywa te blaski.
+        Fraction of pixels with V > 240 in HSV (specular glare on glass screens).
         """
         hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
         v_channel = hsv[:, :, 2]
@@ -267,20 +263,21 @@ class MoireDetector:
         return bright_pixels / float(v_channel.size)
 
 
-# ─── Fasada: PADPipeline ─────────────────────────────────────────────────────
+# --- Facade: PADPipeline ---
 
 
 class PADPipeline:
     """
-    Główny punkt wejścia dla logiki PAD.
+    Entry point combining blink-based and texture-based PAD.
 
-    Użycie typowe:
+    Typical usage::
+
         pad = PADPipeline()
-        pad.reset()                              # na początku każdej sesji
+        pad.reset()  # start of each session
         while streaming:
             result = pad.process_frame(landmarks, face_crop)
             if result.liveness_passed:
-                # kontynuuj weryfikację tożsamości
+                ...
     """
 
     def __init__(
@@ -301,7 +298,7 @@ class PADPipeline:
         self._spec_t = specular_threshold
 
     def reset(self) -> None:
-        """Resetuje stan automatu mrugania. Wywołaj przed każdą nową sesją."""
+        """Reset blink FSM; call at the start of each session."""
         self._blink.reset()
 
     def process_frame(
@@ -310,22 +307,22 @@ class PADPipeline:
         face_crop: np.ndarray,
     ) -> PADResult:
         """
-        Przetwarza jedną klatkę z kamery.
+        Process one camera frame.
 
-        landmarks : (68, 3) float — face.landmark_3d_68 (iBUG 68-punktowy)
-        face_crop : (H, W, 3) BGR  — wyciętý crop twarzy (np. aligned_crop)
+        landmarks : (68, 3) float — face.landmark_3d_68 (iBUG 68)
+        face_crop : (H, W, 3) BGR — aligned face patch (e.g. aligned_crop)
         """
-        # Warstwa 1: EAR / blink + timeout
+        # Layer 1: EAR / blink + timeout
         ear = self._blink.update(landmarks)
         timed_out = self._blink.timed_out
 
-        # Warstwa 2: analiza tekstury / ekranu
+        # Layer 2: texture / screen cues
         moire, lbp_var, specular = self._moire.analyze(face_crop)
 
-        # Decyzja o ataku ekranowym (wystarczy jeden pozytywny sygnał)
+        # Screen attack if any texture cue fires
         screen_attack = moire > self._moire_t or lbp_var > self._lbp_t or specular > self._spec_t
 
-        # Liveness OK tylko gdy: mrugnięcie wykryte ORAZ brak ataku ekranowego ORAZ brak timeout
+        # Liveness OK: blink seen, no screen attack, no blink timeout
         liveness_ok = self._blink.blink_detected and not screen_attack and not timed_out
 
         reason = _build_reason(
@@ -351,31 +348,31 @@ class PADPipeline:
         )
 
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────
+# --- Helpers ---
 
 
 def _eye_aspect_ratio(lm: np.ndarray, idx: tuple[int, ...]) -> float:
     """
-    EAR dla jednego oka — wzór Soukupová & Čech (2016).
+    Eye aspect ratio for one eye — Soukupová & Čech (2016).
 
     EAR = (||P1–P5|| + ||P2–P4||) / (2 · ||P0–P3||)
 
-    Mapowanie dla iBUG 68-punktowego (prawe: 36-41, lewe: 42-47):
-        idx[0] = kąt lewy       idx[3] = kąt prawy
-        idx[1] = górna zewn.    idx[4] = dolna zewn.
-        idx[2] = górna wewn.    idx[5] = dolna wewn.
+    iBUG 68 mapping (right 36–41, left 42–47):
+        idx[0] outer corner    idx[3] inner corner
+        idx[1] upper outer     idx[4] lower outer
+        idx[2] upper inner     idx[5] lower inner
 
-    lm  : (68, 3) lub (68, 2) array — używamy tylko X i Y (kolumny 0, 1)
-    idx : 6-elementowa krotka indeksów
+    lm  : (68, 3) or (68, 2) — uses columns 0,1 (x,y)
+    idx : length-6 index tuple
     """
-    p = lm[list(idx), :2]  # (6, 2) — bierzemy tylko X, Y (pomijamy Z)
+    p = lm[list(idx), :2]  # (6, 2) use x,y only (ignore z if present)
 
     vert_a = float(np.linalg.norm(p[1] - p[5]))
     vert_b = float(np.linalg.norm(p[2] - p[4]))
     horiz = float(np.linalg.norm(p[0] - p[3]))
 
     if horiz < 1e-6:
-        logger.warning("_eye_aspect_ratio: zerowa szerokość oka — zwracam 0.0")
+        logger.warning("_eye_aspect_ratio: zero eye width — returning 0.0")
         return 0.0
 
     return (vert_a + vert_b) / (2.0 * horiz)
@@ -392,21 +389,21 @@ def _build_reason(
     specular: float,
     spec_t: float,
 ) -> str:
-    """Buduje czytelny komunikat o przyczynie odrzucenia (lub pusty string gdy OK)."""
+    """Human-readable rejection reason (empty when liveness would pass)."""
     if timed_out:
-        return "✗ ATAK WYKRYTY: brak mrugnięcia przez >7s — prawdopodobnie zdjęcie lub nagranie."
+        return "ATTACK: no blink for >7s — likely static photo or pre-recorded video."
     if not blink_ok:
-        return "Proszę mrugnąć do kamery."
+        return "Please blink at the camera."
 
     issues: list[str] = []
     if moire > moire_t:
-        issues.append(f"efekt Moiré (FFT={moire:.3f} > {moire_t})")
+        issues.append(f"moiré cue (FFT={moire:.3f} > {moire_t})")
     if lbp_var > lbp_t:
-        issues.append(f"podejrzana tekstura (LBP={lbp_var:.1f} > {lbp_t})")
+        issues.append(f"suspicious texture (LBP={lbp_var:.1f} > {lbp_t})")
     if specular > spec_t:
-        issues.append(f"odbicia ekranu (specular={specular:.3f} > {spec_t})")
+        issues.append(f"screen glare (specular={specular:.3f} > {spec_t})")
 
     if issues:
-        return "Wykryto atak prezentacyjny: " + "; ".join(issues)
+        return "Presentation attack: " + "; ".join(issues)
 
     return ""

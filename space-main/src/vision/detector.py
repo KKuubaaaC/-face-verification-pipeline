@@ -1,10 +1,10 @@
 """
-Face detector and aligner using insightface buffalo_l (2d106det).
+Face detector and aligner using InsightFace ``buffalo_l`` (2d106det).
 
-Odpowiedzialność:
-  - Detekcja twarzy na klatce z kamery
-  - Ekstrakcja 106 landmarków (2d106det)
-  - Transformacja afiniczna (alignment) na podstawie punktów oczu i ust
+Responsibilities:
+  - Detect faces in a frame
+  - Extract 106 2D landmarks (2d106det)
+  - Affine alignment from eye / mouth keypoints to the ArcFace 112×112 template
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 _ARCFACE_INPUT_SIZE: int = 112
 
 # Referencyjne koordynaty 5 keypoints dla arcface_112_v2
-# (lewe oko, prawe oko, nos, lewy kąt ust, prawy kąt ust)
+# (left eye, right eye, nose, left mouth corner, right mouth corner)
 _ARCFACE_DST = np.array(
     [
         [38.2946, 51.6963],
@@ -37,21 +37,21 @@ _ARCFACE_DST = np.array(
 
 @dataclass
 class DetectedFace:
-    """Wynik detekcji jednej twarzy."""
+    """Detection result for a single face."""
 
-    bbox: np.ndarray  # (4,)    — [x1, y1, x2, y2]
-    landmarks_106: np.ndarray  # (106, 2) — surowe współrzędne 2d106det
-    landmarks_68: np.ndarray  # (68, 3)  — standardowe iBUG 68-punktowe (1k3d68)
-    kps: np.ndarray  # (5, 2)  — 5 kluczowych punktów (do alignmentu)
+    bbox: np.ndarray  # (4,)     [x1, y1, x2, y2]
+    landmarks_106: np.ndarray  # (106, 2) raw 2d106det coordinates
+    landmarks_68: np.ndarray  # (68, 3)  iBUG 68 (1k3d68 from InsightFace)
+    kps: np.ndarray  # (5, 2)   five keypoints for alignment
     det_score: float
-    aligned_crop: np.ndarray  # (112, 112, 3) BGR — gotowy do embeddingu
+    aligned_crop: np.ndarray  # (112, 112, 3) BGR, ready for the embedder
 
 
 class FaceDetector:
     """
-    Wrapper wokół insightface FaceAnalysis (buffalo_l).
+    Thin wrapper around InsightFace :class:`FaceAnalysis` (``buffalo_l``).
 
-    Ładuje modele raz przy __init__; process_frame() jest bezstanowe.
+    Models load once in ``__init__``; ``process_frame`` is stateless.
     """
 
     def __init__(
@@ -62,24 +62,28 @@ class FaceDetector:
         root: str = "./models",
     ) -> None:
         _providers = providers or ["CPUExecutionProvider"]
-        logger.info("Ładowanie modeli insightface (%s) z %s...", model_pack, root)
+        logger.info("Loading InsightFace models (%s) from %s...", model_pack, root)
         self._app = FaceAnalysis(
             name=model_pack,
             providers=_providers,
             root=root,
         )
         self._app.prepare(ctx_id=0, det_size=det_size)
-        logger.info("FaceDetector gotowy.")
+        logger.info("FaceDetector ready.")
+
+    @property
+    def face_analysis(self) -> FaceAnalysis:
+        """Shared InsightFace ``FaceAnalysis`` instance (detector + recognition models)."""
+        return self._app
 
     def process_frame(self, frame: np.ndarray) -> list[DetectedFace]:
         """
-        Wykrywa twarze w klatce i zwraca listę DetectedFace.
+        Detect all faces in ``frame`` and return :class:`DetectedFace` instances.
 
-        frame: BGR image (np.ndarray HxWx3)
-        Zwraca pustą listę jeśli żadna twarz nie została wykryta.
+        ``frame``: BGR ``uint8`` array (H×W×3). Returns an empty list if none found.
         """
         if frame is None or frame.size == 0:
-            logger.warning("process_frame: otrzymano pusty obraz.")
+            logger.warning("process_frame: empty image.")
             return []
 
         faces = self._app.get(frame)
@@ -90,19 +94,19 @@ class FaceDetector:
         for face in faces:
             lm106 = getattr(face, "landmark_2d_106", None)
             if lm106 is None:
-                logger.warning("Brak landmark_2d_106 dla wykrytej twarzy — pomijam.")
+                logger.warning("Missing landmark_2d_106 for a face — skipping.")
                 continue
 
             lm68 = getattr(face, "landmark_3d_68", None)
             if lm68 is None:
-                logger.warning("Brak landmark_3d_68 — blink detection niedostępny.")
+                logger.warning("Missing landmark_3d_68 — blink detection unavailable.")
                 lm68 = np.zeros((68, 3), dtype=np.float32)
 
             kps = face.kps  # (5, 2)
             try:
                 crop = _align_face(frame, kps)
             except Exception as exc:
-                logger.error("Błąd alignmentu twarzy: %s", exc)
+                logger.error("Face alignment error: %s", exc)
                 continue
 
             results.append(
@@ -120,8 +124,9 @@ class FaceDetector:
 
     def get_largest_face(self, frame: np.ndarray) -> DetectedFace | None:
         """
-        Zwraca twarz o największej powierzchni bbox (najbliższa kamera).
-        Zwraca None jeśli żadna twarz nie wykryta.
+        Return the face with the largest bounding-box area (closest / dominant).
+
+        Returns ``None`` if no face is detected.
         """
         faces = self.process_frame(frame)
         if not faces:
@@ -132,19 +137,31 @@ class FaceDetector:
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 
+def align_face_from_keypoints(
+    image: np.ndarray,
+    kps: np.ndarray,
+    output_size: int = _ARCFACE_INPUT_SIZE,
+) -> np.ndarray:
+    """
+    Affine-align a face region from five keypoints to the ArcFace 112×112 template.
+
+    Public wrapper around the internal alignment used by :class:`FaceDetector`.
+    """
+    return _align_face(image, kps, output_size)
+
+
 def _align_face(
     image: np.ndarray,
     kps: np.ndarray,
     output_size: int = _ARCFACE_INPUT_SIZE,
 ) -> np.ndarray:
     """
-    Transformacja afiniczna na podstawie 5 kluczowych punktów (kps).
+    Affine warp from five keypoints to ``_ARCFACE_DST`` (scaled to ``output_size``).
 
-    Normalizuje odległość IPD i orientację twarzy względem _ARCFACE_DST.
-    Zwraca: (output_size, output_size, 3) BGR crop.
+    Returns a BGR crop of shape (output_size, output_size, 3).
     """
     dst = _ARCFACE_DST.copy()
-    # skalujemy dst do żądanego rozmiaru (domyślnie 1:1 dla 112px)
+    # scale dst to requested output size (default 112×112)
     scale = output_size / 112.0
     dst *= scale
 
@@ -155,7 +172,7 @@ def _align_face(
     )[0]
 
     if transform is None:
-        raise ValueError("estimateAffinePartial2D zwróciło None — nie można wyrównać twarzy.")
+        raise ValueError("estimateAffinePartial2D returned None — cannot align face.")
 
     aligned = cv2.warpAffine(
         image,

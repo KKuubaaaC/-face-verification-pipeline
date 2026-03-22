@@ -1,12 +1,12 @@
 """
-Static test: Face Verification + Anti-Spoofing na zdjęciach.
+Static test: face verification + anti-spoofing on disk images.
 
-Użycie:
-    uv run python src/static_test.py --probe ścieżka/do/zdjecia.jpg
+Usage:
+    uv run python src/static_test.py --probe path/to/image.jpg
 
-Wyniki:
-    - Czy twarz pasuje do bazy db/ja/ (DeepFace.find)
-    - Czy zdjęcie jest live / spoof (DeepFace.analyze z anti-spoofing)
+Output:
+    - Whether the face matches gallery db/ja/ (DeepFace.find)
+    - Whether the image looks live vs spoof (DeepFace with anti-spoofing)
 """
 
 import argparse
@@ -26,8 +26,8 @@ def run(probe_path: str) -> None:
     print(f"  Probe : {probe}")
     print(f"{'=' * 55}")
 
-    # ── 1. Weryfikacja tożsamości ─────────────────────────────
-    print("\n[1/2] Weryfikacja tożsamości (db/ja/)...")
+    # --- 1. Identity vs db/ja/ ---
+    print("\n[1/2] Identity verification (db/ja/)...")
     try:
         results: list[pd.DataFrame] = DeepFace.find(
             img_path=probe,
@@ -39,20 +39,20 @@ def run(probe_path: str) -> None:
         )
         df = results[0] if results else pd.DataFrame()
         if df.empty:
-            print("  ✗ Nie znaleziono pasującej twarzy w db/ja/")
+            print("  No matching face in db/ja/")
             verified = False
         else:
             best = df.iloc[0]
             dist = best.get("distance", best.iloc[-1])
-            print(f"  ✓ Dopasowanie: {Path(best['identity']).name}")
-            print(f"    dystans = {dist:.4f}")
+            print(f"  Match: {Path(best['identity']).name}")
+            print(f"    distance = {dist:.4f}")
             verified = True
     except Exception as exc:
-        print(f"  ✗ Błąd weryfikacji: {exc}")
+        print(f"  Verification error: {exc}")
         verified = False
 
-    # ── 2. Anti-Spoofing ──────────────────────────────────────
-    print("\n[2/2] Anti-Spoofing...")
+    # --- 2. Anti-spoofing ---
+    print("\n[2/2] Anti-spoofing...")
     try:
         analysis = DeepFace.extract_faces(
             img_path=probe,
@@ -65,29 +65,29 @@ def run(probe_path: str) -> None:
         spoof_conf = face.get("antispoof_score", None)
 
         if is_real is True:
-            label = "REAL ✓"
+            label = "REAL"
         elif is_real is False:
-            label = "SPOOF ✗"
+            label = "SPOOF"
         else:
             label = "UNKNOWN"
 
-        print(f"  Wynik: {label}")
+        print(f"  Result: {label}")
         if spoof_conf is not None:
-            print(f"  Pewność: {spoof_conf:.3f}")
+            print(f"  Confidence: {spoof_conf:.3f}")
 
     except Exception as exc:
-        print(f"  ✗ Błąd anti-spoofing: {exc}")
+        print(f"  Anti-spoof error: {exc}")
         is_real = None
 
-    # ── Podsumowanie ──────────────────────────────────────────
+    # --- Summary ---
     print(f"\n{'─' * 55}")
-    status = "DOSTĘP PRZYZNANY ✓" if (verified and is_real) else "DOSTĘP ODMÓWIONY ✗"
+    status = "ACCESS GRANTED" if (verified and is_real) else "ACCESS DENIED"
     print(f"  {status}")
     print(f"{'─' * 55}\n")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--probe", required=True, help="Ścieżka do testowanego zdjęcia")
+    parser.add_argument("--probe", required=True, help="Path to probe image")
     args = parser.parse_args()
     run(args.probe)

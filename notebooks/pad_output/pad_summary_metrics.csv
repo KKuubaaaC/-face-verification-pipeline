@@ -1,0 +1,9 @@
+Metric,Value,Target (iBeta L2)
+Accuracy,0.9544,—
+AUC (ROC),0.9792,—
+APCER (Print),0.0400,≤ 1%
+APCER (Replay),0.0175,≤ 1%
+APCER (Mask),0.0000,≤ 1%
+APCER (Overall = max),0.0400,≤ 1%
+BPCER,0.1250,≤ 10%
+ACER,0.0825,—
