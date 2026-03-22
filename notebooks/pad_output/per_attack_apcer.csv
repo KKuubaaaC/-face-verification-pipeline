@@ -1,5 +1,0 @@
-Attack Type,N_samples,N_missed,APCER
-Print Attack,400,16,0.04
-Screen Replay,400,7,0.0175
-Paper Mask,400,0,0.0
-OVERALL (max),1200,23,0.04
