@@ -24,3 +24,6 @@ models/
 space-main/models/
 # Large embedding caches (regenerate via notebooks)
 results/*.npz
+
+# PDF files
+*.pdf

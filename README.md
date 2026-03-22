@@ -96,7 +96,7 @@ The image starts Jupyter Notebook on `0.0.0.0:8888` (see `Dockerfile` `CMD`). Mo
 
 ## Notebooks
 
-Exploratory EDA is in `00_EDA.ipynb`. The seven numbered pipeline notebooks below cover detection through PAD.
+Exploratory EDA is in `00_EDA.ipynb`. The seven numbered pipeline notebooks below cover detection through the end-to-end summary.
 
 | Notebook | Purpose |
 | --- | --- |
@@ -105,8 +105,8 @@ Exploratory EDA is in `00_EDA.ipynb`. The seven numbered pipeline notebooks belo
 | `03_compare_pairs.ipynb` | Pairwise scores and distance distributions |
 | `04_evaluate.ipynb` | ROC, AUC, EER, TAR@FAR; writes `results/evaluation_metrics.csv` |
 | `05_xai_gradcam.ipynb` | Siamese Grad-CAM explanations for verification pairs |
-| `06_SOTA_ViT_Evaluation.ipynb` | ViT-B/16 and comparison against strong baselines |
-| `07_PAD_analysis.ipynb` | Presentation attack detection layers, metrics, and plots |
+| `06_SOTA_ViT_Evaluation.ipynb` | SwinFace (Swin-T Transformer) evaluation and comparison against ArcFace / GhostFaceNetV2 |
+| `07_summary.ipynb` | End-to-end pipeline summary: detection stats, ROC/AUC/EER for all 3 models, score distributions, PAD metrics, final rankings |
 
 ## Models
 
@@ -117,16 +117,7 @@ Exploratory EDA is in `00_EDA.ipynb`. The seven numbered pipeline notebooks belo
 | SwinFace | Swin-T + FAM + multitask heads | 512 | Local `models/swinface.pt` or HF (see `space-main` README) |
 | ViT-B/16 | torchvision ViT, classifier head removed | 768 | torchvision ImageNet-21k weights |
 
-## XAI
 
-**Siamese Grad-CAM** (`05_xai_gradcam.ipynb`): class-discriminative saliency on the Siamese verification network to show which regions drive the match score. **Attention rollout** (where used with ViT): propagation of attention weights across layers for a coarse spatial attribution map (Abnar & Zuidema, 2020).
-
-## References
-
-- Deng, Guo, Xue, Zafeiriou. *ArcFace: Additive Angular Margin Loss for Deep Face Recognition.* CVPR, 2019.
-- Liu et al. *SwinFace: A Multi-task Transformer for Face Recognition.* arXiv:2308.11509, 2023.
-- Soukupová & Čech. *Real-Time Eye Blink Detection Using Facial Landmarks.* CVWW, 2016 (EAR).
-- Abnar & Zuidema. *Quantifying Attention Flow in Transformers.* ACL, 2020 (attention rollout).
 
 ## License: MIT
 
